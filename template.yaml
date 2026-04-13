@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Crawls tarunraja.info with Playwright, stitches MP4, uploads to S3, self-terminates.
+
+Parameters:
+  S3Bucket:
+    Type: String
+  S3Prefix:
+    Type: String
+    Default: website-videos
+  TargetURL:
+    Type: String
+    Default: https://tarunraja.info
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  VideoGenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-VideoGenRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Upload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/${S3Prefix}/*"
+              - Effect: Allow
+                Action: [ec2:TerminateInstances]
+                Resource: "*"
+
+  VideoGenInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref VideoGenRole]
+
+  VideoGenSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Video gen SG, outbound only
+
+  VideoGenInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref VideoGenInstanceProfile
+      SecurityGroupIds: [!Ref VideoGenSG]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-video-gen"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/video-gen.log 2>&1
+
+          REGION="${AWS::Region}"
+          S3_BUCKET="${S3Bucket}"
+          S3_PREFIX="${S3Prefix}"
+          TARGET_URL="${TargetURL}"
+          # IMDSv2-compatible instance ID fetch
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          echo "Instance ID: $INSTANCE_ID" 
+
+          echo "START $(date)"
+          echo "Target: $TARGET_URL"
+          echo "Bucket: $S3_BUCKET"
+
+          # ── 1. Deps ──────────────────────────────────────────────────────
+          dnf update -y
+          dnf install -y python3-pip ImageMagick unzip tar xz
+
+          # ffmpeg static binary - AL2023 has no ffmpeg in any repo
+          curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          mv /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg
+          chmod +x /usr/local/bin/ffmpeg
+          ffmpeg -version | head -1
+
+          # ── 2. Chromium deps for AL2023 (playwright install-deps uses apt, won't work here)
+          dnf install -y atk cups-libs gtk3 libXcomposite libXcursor libXdamage \
+            libXext libXi libXrandr libXScrnSaver libXtst pango alsa-lib \
+            at-spi2-atk at-spi2-core libdrm mesa-libgbm nss nspr \
+            libxkbcommon libgbm xdg-utils
+
+          # ── 3. Playwright ────────────────────────────────────────────────
+          pip3 install playwright
+          python3 -m playwright install chromium
+
+          # ── 3. Write Python crawler (base64-encoded to avoid heredoc issues) ──
+          python3 - << 'ENCODE'
+          import base64
+          encoded = "aW1wb3J0IGFzeW5jaW8sIG9zLCByZSwgc3VicHJvY2Vzcywgc3lzCmZyb20gdXJsbGliLnBhcnNlIGltcG9ydCB1cmxwYXJzZQpmcm9tIHBsYXl3cmlnaHQuYXN5bmNfYXBpIGltcG9ydCBhc3luY19wbGF5d3JpZ2h0CgpCQVNFX1VSTCAgPSBzeXMuYXJndlsxXQpTQ1JFRU5TICAgPSAiL29wdC9vdXRwdXQvc2NyZWVucyIKTUFYX0RFUFRIID0gMgpNQVhfTElOS1MgPSAxMgpvcy5tYWtlZGlycyhTQ1JFRU5TLCBleGlzdF9vaz1UcnVlKQoKc2VlbiA9IHNldCgpCmN0ciAgPSBbMF0KCmRlZiBzbHVnKHVybCk6CiAgICBwID0gdXJscGFyc2UodXJsKQogICAgcGF0aCA9IHAucGF0aC5zdHJpcCgiLyIpLnJlcGxhY2UoIi8iLCJfIikgb3IgImhvbWUiCiAgICByZXR1cm4gcmUuc3ViKHIiW15hLXowLTlfLV0iLCIiLHBhdGgubG93ZXIoKSlbOjQwXSBvciAiaG9tZSIKCmRlZiBzYWZlX2xhYmVsKHRleHQpOgogICAgIiIiU3RyaXAgQUxMIG5vbi1BU0NJSSBhbmQgbm9uLXNhZmUgY2hhcnMgc28gZmlsZW5hbWVzIG5ldmVyIGhhdmUgbmV3bGluZXMvdW5pY29kZS4iIiIKICAgIHQgPSB0ZXh0LmVuY29kZSgiYXNjaWkiLCJpZ25vcmUiKS5kZWNvZGUoKQogICAgdCA9IHJlLnN1YihyIlteYS16MC05IF8tXSIsIiIsIHQubG93ZXIoKSkKICAgIHQgPSByZS5zdWIociJccysiLCItIiwgdC5zdHJpcCgpKQogICAgcmV0dXJuIHRbOjI1XSBvciAiY2xpY2siCgpkZWYgaW50ZXJuYWwodXJsKToKICAgIHAgPSB1cmxwYXJzZSh1cmwpCiAgICBpZiBwLnNjaGVtZSBub3QgaW4gKCJodHRwIiwiaHR0cHMiKTogcmV0dXJuIEZhbHNlCiAgICByZXR1cm4gcC5uZXRsb2MgPT0gdXJscGFyc2UoQkFTRV9VUkwpLm5ldGxvYwoKYXN5bmMgZGVmIHNjcm9sbChwYWdlKToKICAgIHRvdGFsID0gYXdhaXQgcGFnZS5ldmFsdWF0ZSgiZG9jdW1lbnQuYm9keS5zY3JvbGxIZWlnaHQiKQogICAgdmggICAgPSBhd2FpdCBwYWdlLmV2YWx1YXRlKCJ3aW5kb3cuaW5uZXJIZWlnaHQiKQogICAgc3RlcCAgPSBtYXgodmgvLzMsIDIwMCkKICAgIHBvcyAgID0gMAogICAgd2hpbGUgcG9zIDwgdG90YWw6CiAgICAgICAgYXdhaXQgcGFnZS5ldmFsdWF0ZShmIndpbmRvdy5zY3JvbGxUbyh7e3RvcDp7cG9zfSxiZWhhdmlvcjonc21vb3RoJ319KSIpCiAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwLjE1KQogICAgICAgIHBvcyArPSBzdGVwCiAgICBhd2FpdCBwYWdlLmV2YWx1YXRlKCJ3aW5kb3cuc2Nyb2xsVG8oe3RvcDowLGJlaGF2aW9yOidzbW9vdGgnfSkiKQogICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwLjMpCgphc3luYyBkZWYgc2hvdChwYWdlLCBsYWJlbCk6CiAgICBjdHJbMF0gKz0gMQogICAgIyBHdWFyYW50ZWUgc2FmZSBmaWxlbmFtZSDigJQgbm8gbmV3bGluZXMsIG5vIHVuaWNvZGUKICAgIHNhZmUgPSByZS5zdWIociJbXmEtekEtWjAtOV8tXSIsICIiLCBsYWJlbClbOjYwXQogICAgcGF0aCA9IGYie1NDUkVFTlN9L3tjdHJbMF06MDRkfV97c2FmZX0ucG5nIgogICAgYXdhaXQgcGFnZS5zY3JlZW5zaG90KHBhdGg9cGF0aCwgZnVsbF9wYWdlPVRydWUpCiAgICBwcmludChmIlNIT1Qge3BhdGh9IiwgZmx1c2g9VHJ1ZSkKCmFzeW5jIGRlZiB3YWl0X2Zvcl9pZGxlKHBhZ2UsIHRpbWVvdXQ9NTAwMCk6CiAgICAiIiJXYWl0IGZvciBuZXR3b3JrIHRvIHNldHRsZSBhZnRlciBhIGNsaWNrLiIiIgogICAgdHJ5OgogICAgICAgIGF3YWl0IHBhZ2Uud2FpdF9mb3JfbG9hZF9zdGF0ZSgibmV0d29ya2lkbGUiLCB0aW1lb3V0PXRpbWVvdXQpCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIGF3YWl0IGFzeW5jaW8uc2xlZXAoMS41KQoKYXN5bmMgZGVmIGNsaWNrX2ludGVyYWN0aXZlKHBhZ2UsIGxibCk6CiAgICBzZWxlY3RvcnMgPSBbCiAgICAgICAgIltyb2xlPXRhYl0iLAogICAgICAgICJbcm9sZT1idXR0b25dOm5vdChbZGlzYWJsZWRdKSIsCiAgICAgICAgImJ1dHRvbjpub3QoW2Rpc2FibGVkXSk6bm90KFt0eXBlPXN1Ym1pdF0pIiwKICAgICAgICAiW2RhdGEtdGFiXSxbZGF0YS10b2dnbGVdLFtkYXRhLXRhcmdldF0iLAogICAgICAgICJkZXRhaWxzID4gc3VtbWFyeSIsCiAgICAgICAgIlthcmlhLXNlbGVjdGVkPWZhbHNlXSIsCiAgICAgICAgIlthcmlhLWV4cGFuZGVkPWZhbHNlXSIsCiAgICAgICAgIi5hY2NvcmRpb24taGVhZGVyLC5hY2NvcmRpb24tdG9nZ2xlIiwKICAgIF0KICAgIGNsaWNrZWRfdGV4dHMgPSBzZXQoKQogICAgY2xpY2tfY291bnQgPSAwCgogICAgZm9yIHNlbCBpbiBzZWxlY3RvcnM6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBlbHMgPSBhd2FpdCBwYWdlLnF1ZXJ5X3NlbGVjdG9yX2FsbChzZWwpCiAgICAgICAgICAgIGZvciBlbCBpbiBlbHNbOjhdOgogICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgIGlmIG5vdCBhd2FpdCBlbC5pc192aXNpYmxlKCk6IGNvbnRpbnVlCiAgICAgICAgICAgICAgICAgICAgYm94ID0gYXdhaXQgZWwuYm91bmRpbmdfYm94KCkKICAgICAgICAgICAgICAgICAgICBpZiBub3QgYm94OiBjb250aW51ZQogICAgICAgICAgICAgICAgICAgIHJhd190ZXh0ID0gKGF3YWl0IGVsLmlubmVyX3RleHQoKSkuc3RyaXAoKQogICAgICAgICAgICAgICAgICAgIGxhYmVsID0gc2FmZV9sYWJlbChyYXdfdGV4dCkKICAgICAgICAgICAgICAgICAgICBpZiBub3QgbGFiZWwgb3IgbGFiZWwgaW4gY2xpY2tlZF90ZXh0czogY29udGludWUKICAgICAgICAgICAgICAgICAgICAjIFNraXAgbGlua3MgdGhhdCBuYXZpZ2F0ZSB0byBvdGhlciBwYWdlcwogICAgICAgICAgICAgICAgICAgIGhyZWYgPSBhd2FpdCBlbC5nZXRfYXR0cmlidXRlKCJocmVmIikgb3IgIiIKICAgICAgICAgICAgICAgICAgICBpZiBocmVmIGFuZCBub3QgaHJlZi5zdGFydHN3aXRoKCIjIikgYW5kIG5vdCBocmVmLnN0YXJ0c3dpdGgoImphdmFzY3JpcHQiKToKICAgICAgICAgICAgICAgICAgICAgICAgdGFyZ2V0ID0gaHJlZiBpZiBocmVmLnN0YXJ0c3dpdGgoImh0dHAiKSBlbHNlIEJBU0VfVVJMLnJzdHJpcCgiLyIpICsgIi8iICsgaHJlZi5sc3RyaXAoIi8iKQogICAgICAgICAgICAgICAgICAgICAgICBpZiB1cmxwYXJzZSh0YXJnZXQpLm5ldGxvYyAhPSB1cmxwYXJzZShCQVNFX1VSTCkubmV0bG9jOiBjb250aW51ZQogICAgICAgICAgICAgICAgICAgICAgICBpZiB1cmxwYXJzZSh0YXJnZXQpLnBhdGggIT0gdXJscGFyc2UocGFnZS51cmwpLnBhdGg6IGNvbnRpbnVlCiAgICAgICAgICAgICAgICAgICAgY2xpY2tlZF90ZXh0cy5hZGQobGFiZWwpCiAgICAgICAgICAgICAgICAgICAgcHJpbnQoZiIgIENMSUNLIFt7c2VsfV0gLT4ge2xhYmVsIXJ9IiwgZmx1c2g9VHJ1ZSkKICAgICAgICAgICAgICAgICAgICBhd2FpdCBlbC5zY3JvbGxfaW50b192aWV3X2lmX25lZWRlZCgpCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwLjIpCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgZWwuY2xpY2sodGltZW91dD0zMDAwKQogICAgICAgICAgICAgICAgICAgICMgV2FpdCBmb3IgbmV0d29yayBpZGxlIHNvIEFQSS1kcml2ZW4gdGFicyBmdWxseSBsb2FkCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgd2FpdF9mb3JfaWRsZShwYWdlLCB0aW1lb3V0PTYwMDApCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwLjUpCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgc2hvdChwYWdlLCBmIntsYmx9X3RhYntjbGlja19jb3VudDowMmR9X3tsYWJlbH0iKQogICAgICAgICAgICAgICAgICAgIGNsaWNrX2NvdW50ICs9IDEKICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgICAgICAgICBwcmludChmIiAgQ0xJQ0sgRVJSOiB7ZX0iLCBmbHVzaD1UcnVlKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKICAgIGlmIGNsaWNrX2NvdW50OgogICAgICAgIHByaW50KGYiICBDbGlja2VkIHtjbGlja19jb3VudH0gaW50ZXJhY3RpdmUgZWxlbWVudHMiLCBmbHVzaD1UcnVlKQoKYXN5bmMgZGVmIGNyYXdsKHBhZ2UsIHVybCwgZGVwdGgpOgogICAgaWYgdXJsIGluIHNlZW4gb3IgZGVwdGggPiBNQVhfREVQVEg6IHJldHVybgogICAgc2Vlbi5hZGQodXJsKQogICAgaWYgdXJscGFyc2UodXJsKS5uZXRsb2MgIT0gdXJscGFyc2UoQkFTRV9VUkwpLm5ldGxvYzoKICAgICAgICBwcmludChmIlNLSVAgZXh0ZXJuYWwge3VybH0iKTsgcmV0dXJuCiAgICBwcmludChmIlBBR0UgW3tkZXB0aH1dIHt1cmx9IiwgZmx1c2g9VHJ1ZSkKICAgIHRyeToKICAgICAgICBhd2FpdCBwYWdlLmdvdG8odXJsLCB3YWl0X3VudGlsPSJuZXR3b3JraWRsZSIsIHRpbWVvdXQ9MjUwMDApCiAgICAgICAgaWYgdXJscGFyc2UocGFnZS51cmwpLm5ldGxvYyAhPSB1cmxwYXJzZShCQVNFX1VSTCkubmV0bG9jOgogICAgICAgICAgICBwcmludChmIlNLSVAgcmVkaXJlY3Qge3BhZ2UudXJsfSIpOyByZXR1cm4KICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBwcmludChmIkVSUiB7ZX0iKTsgcmV0dXJuCiAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDEpCiAgICBsYmwgPSBzbHVnKHVybCkKICAgIGF3YWl0IHNob3QocGFnZSwgbGJsICsgIl90b3AiKQogICAgYXdhaXQgc2Nyb2xsKHBhZ2UpCiAgICBhd2FpdCBzaG90KHBhZ2UsIGxibCArICJfYm90IikKICAgIGF3YWl0IGNsaWNrX2ludGVyYWN0aXZlKHBhZ2UsIGxibCkKICAgIGlmIGRlcHRoIDwgTUFYX0RFUFRIOgogICAgICAgIGhyZWZzID0gYXdhaXQgcGFnZS5ldmFsX29uX3NlbGVjdG9yX2FsbCgiYVtocmVmXSIsImVscz0+ZWxzLm1hcChlPT5lLmhyZWYpIikKICAgICAgICBraWRzICA9IGxpc3QoZGljdC5mcm9ta2V5cyhbaCBmb3IgaCBpbiBocmVmcyBpZiBpbnRlcm5hbChoKSBhbmQgaCBub3QgaW4gc2Vlbl0pKVs6TUFYX0xJTktTXQogICAgICAgIGZvciBrIGluIGtpZHM6CiAgICAgICAgICAgIGF3YWl0IGNyYXdsKHBhZ2UsIGssIGRlcHRoKzEpCgpkZWYgY2FyZChwYXRoLCBsMSwgbDIsIGwzPSIiKToKICAgIHN1YnByb2Nlc3MucnVuKFsKICAgICAgICAiY29udmVydCIsIi1zaXplIiwiMTI4MHg4MDAiLCJ4YzojMGQxMTE3IiwKICAgICAgICAiLWZpbGwiLCIjZTZlZGYzIiwiLWZvbnQiLCJEZWphVnUtU2Fucy1Cb2xkIiwiLXBvaW50c2l6ZSIsIjU2IiwKICAgICAgICAiLWdyYXZpdHkiLCJDZW50ZXIiLCItYW5ub3RhdGUiLCIrMC04MCIsbDEsCiAgICAgICAgIi1maWxsIiwiIzU4YTZmZiIsIi1mb250IiwiRGVqYVZ1LVNhbnMiLCItcG9pbnRzaXplIiwiMzIiLAogICAgICAgICItZ3Jhdml0eSIsIkNlbnRlciIsIi1hbm5vdGF0ZSIsIiswKzIwIixsMiwKICAgICAgICAiLWZpbGwiLCIjOGI5NDllIiwiLXBvaW50c2l6ZSIsIjIyIiwKICAgICAgICAiLWdyYXZpdHkiLCJDZW50ZXIiLCItYW5ub3RhdGUiLCIrMCsxMDAiLGwzLAogICAgICAgIHBhdGhdLCBjYXB0dXJlX291dHB1dD1UcnVlKQoKYXN5bmMgZGVmIG1haW4oKToKICAgIGNhcmQoIi9vcHQvb3V0cHV0LzAwMDBfdGl0bGUucG5nIiwiVGFydW4gUmFqYSIsCiAgICAgICAgICJTZW5pb3IgTGVhZCBTV0UgLSBBSSBTeXN0ZW1zIEFyY2hpdGVjdCIsCiAgICAgICAgIHVybHBhcnNlKEJBU0VfVVJMKS5uZXRsb2MpCiAgICBhc3luYyB3aXRoIGFzeW5jX3BsYXl3cmlnaHQoKSBhcyBwdzoKICAgICAgICBicm93c2VyID0gYXdhaXQgcHcuY2hyb21pdW0ubGF1bmNoKGhlYWRsZXNzPVRydWUpCiAgICAgICAgY3R4ID0gYXdhaXQgYnJvd3Nlci5uZXdfY29udGV4dCgKICAgICAgICAgICAgdmlld3BvcnQ9eyJ3aWR0aCI6MTI4MCwiaGVpZ2h0Ijo4MDB9LAogICAgICAgICAgICB1c2VyX2FnZW50PSJNb3ppbGxhLzUuMCBDaHJvbWUvMTIyIikKICAgICAgICBwYWdlID0gYXdhaXQgY3R4Lm5ld19wYWdlKCkKICAgICAgICBhd2FpdCBjcmF3bChwYWdlLCBCQVNFX1VSTCwgMCkKICAgICAgICBhd2FpdCBicm93c2VyLmNsb3NlKCkKICAgIGNhcmQoIi9vcHQvb3V0cHV0Lzk5OTlfb3V0cm8ucG5nIiwKICAgICAgICAgdXJscGFyc2UoQkFTRV9VUkwpLm5ldGxvYywKICAgICAgICAgIkNvdXJzZXMgLSBQcm9qZWN0cyAtIEFJIEFyY2hpdGVjdHVyZSIsCiAgICAgICAgICJnaXRodWIuY29tL3JhamF0YXJ1biIpCiAgICBwcmludChmIkRPTkUge2N0clswXX0gc2NyZWVuc2hvdHMiLCBmbHVzaD1UcnVlKQoKYXN5bmNpby5ydW4obWFpbigpKQ=="
+          with open("/opt/crawl.b64","w") as f:
+              f.write(encoded)
+          ENCODE
+
+          python3 -c "import base64; open('/opt/crawl.py','wb').write(base64.b64decode(open('/opt/crawl.b64').read()))"
+          echo "Crawler written: $(wc -l /opt/crawl.py) lines"
+
+          # ── 4. Run crawler ───────────────────────────────────────────────
+          mkdir -p /opt/output/screens
+          python3 /opt/crawl.py "$TARGET_URL"
+          echo "Screenshots: $(ls /opt/output/screens/*.png 2>/dev/null | wc -l)"
+
+          # ── 5. Build ffmpeg concat list ──────────────────────────────────
+          FRAMES_TXT="/opt/output/frames.txt"
+          > "$FRAMES_TXT"
+          LAST=""
+          for img in $(ls /opt/output/*.png /opt/output/screens/*.png 2>/dev/null | sort); do
+              echo "file '$(realpath "$img")'" >> "$FRAMES_TXT"
+              echo "duration 4"               >> "$FRAMES_TXT"
+              LAST="$img"
+          done
+          echo "file '$(realpath "$LAST")'" >> "$FRAMES_TXT"
+
+          echo "Frame count: $(grep -c 'file ' "$FRAMES_TXT")"
+
+          # ── 6. Render video ──────────────────────────────────────────────
+          ffmpeg -y \
+            -f concat -safe 0 -i "$FRAMES_TXT" \
+            -vf "scale=1280:800:force_original_aspect_ratio=decrease,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=#0d1117,fps=30" \
+            -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p \
+            /opt/output/tarunraja_product_video.mp4
+
+          echo "Video size: $(du -sh /opt/output/tarunraja_product_video.mp4)"
+
+          # ── 7. Upload ────────────────────────────────────────────────────
+          aws s3 cp /opt/output/tarunraja_product_video.mp4 \
+            "s3://$S3_BUCKET/$S3_PREFIX/tarunraja_product_video.mp4" \
+            --region "$REGION"
+
+          cd /opt/output && zip -r screens.zip screens/
+          aws s3 cp /opt/output/screens.zip \
+            "s3://$S3_BUCKET/$S3_PREFIX/screens.zip" \
+            --region "$REGION"
+
+          # Also upload the log itself for debugging
+          aws s3 cp /var/log/video-gen.log \
+            "s3://$S3_BUCKET/$S3_PREFIX/video-gen.log" \
+            --region "$REGION"
+
+          echo "UPLOAD DONE $(date)"
+
+          # ── 8. Self-terminate ────────────────────────────────────────────
+          aws ec2 terminate-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION"
+
+Outputs:
+  VideoS3Path:
+    Value: !Sub "s3://${S3Bucket}/${S3Prefix}/tarunraja_product_video.mp4"
+  LogS3Path:
+    Value: !Sub "s3://${S3Bucket}/${S3Prefix}/video-gen.log"
+  WatchLogs:
+    Value: !Sub "aws ssm start-session --target ${VideoGenInstance} --region ${AWS::Region}"
