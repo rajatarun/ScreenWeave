@@ -3,17 +3,21 @@
 /**
  * ScreenWeave – Artifact Retrieval Lambda
  *
- * GET /session/{session_id}[?include=screenshots,states,transitions,trace]
+ * Dual-mode: invocable from API Gateway (HTTP) OR directly from the MCP server
+ * via the AWS SDK (IAM auth, no API Gateway in the path).
  *
- * Fetches session metadata from DynamoDB, then generates pre-signed S3 URLs
- * for all requested artifact types and returns a structured bundle.
+ * API Gateway mode  – event shape: { pathParameters: { session_id }, queryStringParameters: { include } }
+ * Direct mode       – event shape: { session_id: string, include?: string }
  *
- * Environment variables (required):
+ * Returns:
+ *   API Gateway mode  → { statusCode, headers, body }  (proxy integration format)
+ *   Direct mode       → plain data object (or throws on error so Lambda propagates FunctionError)
+ *
+ * Environment variables:
  *   SESSIONS_TABLE              – DynamoDB table name
  *   ARTIFACTS_BUCKET            – S3 bucket holding artifacts
  *   BUCKET_PREFIX               – S3 key root prefix (default: "screenweave")
  *   SIGNED_URL_EXPIRES_SECONDS  – Pre-signed URL TTL (default: 3600)
- *   NODE_ENV                    – Runtime environment label
  */
 
 const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
@@ -39,25 +43,36 @@ const SIGN_BATCH_SIZE = 25;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
+  // Detect invocation source: API Gateway sends pathParameters; direct sends session_id at root.
+  const isApiGateway = event.pathParameters !== undefined;
+
   try {
     // ── Step 1: Input validation ──────────────────────────────────────────
-    const sessionId = event.pathParameters && event.pathParameters.session_id;
+    const sessionId = isApiGateway
+      ? (event.pathParameters && event.pathParameters.session_id)
+      : event.session_id;
 
     if (!sessionId) {
-      return buildResponse(400, { error: 'Missing required path parameter: session_id' });
+      const err = { error: 'Missing required parameter: session_id' };
+      if (isApiGateway) return buildResponse(400, err);
+      throw new Error(err.error);
     }
 
     if (!SESSION_ID_REGEX.test(sessionId)) {
-      return buildResponse(400, {
-        error: 'Invalid session_id. Must be 4–64 characters: alphanumeric, hyphens, or underscores.',
-      });
+      const err = { error: 'Invalid session_id. Must be 4–64 characters: alphanumeric, hyphens, or underscores.' };
+      if (isApiGateway) return buildResponse(400, err);
+      throw new Error(err.error);
     }
 
-    // Parse ?include= query param; default to all artifact types
-    const includeParam = event.queryStringParameters && event.queryStringParameters.include;
-    const includeSet = includeParam
-      ? new Set(includeParam.split(',').map((s) => s.trim().toLowerCase()))
-      : new Set(['screenshots', 'states', 'transitions', 'trace']);
+    // Parse include: query string (API GW) or plain string/array (direct)
+    const includeParam = isApiGateway
+      ? (event.queryStringParameters && event.queryStringParameters.include)
+      : (Array.isArray(event.include) ? event.include.join(',') : event.include);
+
+    // 'none' is a sentinel used by get_session_status to skip all S3 work
+    const includeSet = (!includeParam || includeParam === 'none')
+      ? (includeParam === 'none' ? new Set() : new Set(['screenshots', 'states', 'transitions', 'trace']))
+      : new Set(includeParam.split(',').map((s) => s.trim().toLowerCase()));
 
     // ── Step 2: Fetch session metadata from DynamoDB ──────────────────────
     const dbResult = await dynamo.send(
@@ -68,7 +83,9 @@ exports.handler = async (event) => {
     );
 
     if (!dbResult.Item) {
-      return buildResponse(404, { error: `Session not found: ${sessionId}` });
+      const err = { error: `Session not found: ${sessionId}` };
+      if (isApiGateway) return buildResponse(404, err);
+      throw new Error(err.error);
     }
 
     const session = unmarshall(dbResult.Item);
@@ -145,28 +162,30 @@ exports.handler = async (event) => {
     });
 
     // ── Construct final response ──────────────────────────────────────────
-    return buildResponse(200, {
+    const responseData = {
       session_id: sessionId,
       status: session.status,
       artifacts,
       indexed_states: indexedStates,
       metadata: {
-        created_at: session.created_at || null,
-        updated_at: session.updated_at || null,
+        created_at:    session.created_at    || null,
+        updated_at:    session.updated_at    || null,
         summary_stats: session.summary_stats || null,
       },
-    });
+    };
+
+    // API Gateway expects the proxy envelope; direct callers get plain data.
+    return isApiGateway ? buildResponse(200, responseData) : responseData;
+
   } catch (err) {
-    // Log structured error; never leak internal details to caller
-    console.error(
-      JSON.stringify({
-        level: 'ERROR',
-        message: err.message,
-        code: err.code || err.name,
-        stack: err.stack,
-      })
-    );
-    return buildResponse(500, { error: 'Internal server error' });
+    console.error(JSON.stringify({
+      level:   'ERROR',
+      message: err.message,
+      code:    err.code || err.name,
+      stack:   err.stack,
+    }));
+    if (isApiGateway) return buildResponse(500, { error: 'Internal server error' });
+    throw err; // Let Lambda surface it as a FunctionError to the direct caller
   }
 };
 

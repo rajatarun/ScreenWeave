@@ -276,6 +276,30 @@ Resources:
           Value: ScreenWeave
 
   # ───────────────────────────────────────────────
+  # 5a. IAM: MCP Server invoke policy
+  #     Attach to the IAM principal (user or role) that runs the MCP server
+  #     locally. Grants only lambda:InvokeFunction on the two Lambdas — no
+  #     API Gateway credentials needed.
+  # ───────────────────────────────────────────────
+  McpServerInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub screenweave-mcp-invoke-${Environment}
+      Description: >
+        Allow the ScreenWeave MCP server to directly invoke the startCrawl and
+        getSession Lambda functions via the AWS SDK (IAM auth). Attach to the
+        IAM user or role that runs src/mcp-server/index.js.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InvokeCrawlFunctions
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt StartCrawlFunction.Arn
+              - !GetAtt GetSessionFunction.Arn
+
+  # ───────────────────────────────────────────────
   # 5. CloudWatch Log Group (explicit retention)
   # ───────────────────────────────────────────────
   StartCrawlLogGroup:
@@ -638,10 +662,19 @@ Outputs:
     Export:
       Name: !Sub ScreenWeave-CrawlerSG-${Environment}
 
+  McpServerInvokePolicyArn:
+    Description: >
+      ARN of the IAM managed policy to attach to the principal running the MCP
+      server. Grants lambda:InvokeFunction on startCrawl and getSession only.
+    Value: !Ref McpServerInvokePolicy
+    Export:
+      Name: !Sub ScreenWeave-McpInvokePolicy-${Environment}
+
   McpServerConfig:
     Description: >
-      Environment variables to set when running the ScreenWeave MCP server.
-      SCREENWEAVE_API_URL = this endpoint, SCREENWEAVE_API_KEY = API key value.
+      Environment variables required by src/mcp-server/index.js.
+      The MCP server invokes Lambda directly via IAM — no API Gateway URL or key needed.
     Value: !Sub >-
-      SCREENWEAVE_API_URL=https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
-      SCREENWEAVE_API_KEY=<retrieve DefaultApiKeyId value>
+      AWS_REGION=${AWS::Region}
+      START_CRAWL_FUNCTION=screenweave-start-crawl-${Environment}
+      GET_SESSION_FUNCTION=screenweave-get-session-${Environment}
