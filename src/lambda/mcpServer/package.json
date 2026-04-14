@@ -1,0 +1,17 @@
+{
+  "name": "screenweave-mcp-lambda",
+  "version": "1.0.0",
+  "description": "ScreenWeave MCP server Lambda – implements MCP JSON-RPC over HTTP with all crawl/retrieval logic inline",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.731.0",
+    "@aws-sdk/client-ec2": "^3.731.0",
+    "@aws-sdk/client-s3": "^3.731.0",
+    "@aws-sdk/s3-request-presigner": "^3.731.0",
+    "@aws-sdk/util-dynamodb": "^3.731.0"
+  }
+}
