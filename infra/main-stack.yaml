@@ -1,0 +1,456 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ScreenWeave – Unified stack.
+  Provisions all infrastructure in a single template:
+    • DynamoDB session index
+    • EC2 crawler IAM role / instance profile / security group
+    • McpServer Lambda (MCP JSON-RPC + all business logic)
+    • API Gateway v2 HTTP API exposing POST /mcp and GET /mcp
+  MCP clients connect to the McpEndpoint output — no AWS credentials required.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ArtifactsBucket:
+    Type: String
+    Description: >
+      Name of the existing S3 bucket that stores Playwright artifacts
+      (screenshots, states.json, transitions.json, trace.zip).
+
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      S3 bucket that holds the packaged Lambda ZIP (mcpServer.zip) and
+      the crawler script (crawl.py). Produced by deploy.sh.
+
+  LambdaCodeKey:
+    Type: String
+    Default: screenweave/lambda/mcpServer.zip
+    Description: S3 key of the McpServer Lambda ZIP.
+
+  BucketPrefix:
+    Type: String
+    Default: screenweave
+    Description: >
+      Root S3 key prefix. Artifacts land at {BucketPrefix}/{session_id}/.
+      crawl.py is expected at {BucketPrefix}/crawler/crawl.py in LambdaCodeBucket.
+
+  CrawlerAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AL2023 AMI for EC2 crawler workers (resolved at deploy time).
+
+  CrawlerInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: EC2 instance type for crawler workers.
+
+  SignedUrlExpiresSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 43200
+    Description: Pre-signed S3 URL TTL in seconds (5 min – 12 hrs).
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment label used in resource names and the API stage.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. DynamoDB – session metadata index
+  #
+  # PK: session_id (String)  → value format "SESSION#{uuid}"
+  #
+  # Attributes written by the Lambda:
+  #   status          RUNNING | COMPLETED | FAILED
+  #   target_url      String
+  #   max_depth       Number
+  #   max_links       Number
+  #   created_at      ISO-8601
+  #   updated_at      ISO-8601
+  #   ttl             Unix epoch (7-day TTL)
+  #
+  # Attributes written by the EC2 crawler on completion:
+  #   artifact_manifest   Map  { "<state_id>": { url, timestamp } }
+  #   summary_stats       Map  { total_states, duration_seconds, … }
+  # ─────────────────────────────────────────────────────────────────────────
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub screenweave_sessions_${Environment}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. IAM – McpServer Lambda execution role
+  #    Needs: DynamoDB read/write, S3 read/list (for artifact retrieval and
+  #    URL signing), EC2 RunInstances (to launch crawlers), IAM PassRole
+  #    (to hand the crawler its instance profile).
+  # ─────────────────────────────────────────────────────────────────────────
+  McpServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub screenweave-mcp-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SessionReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt SessionsTable.Arn
+
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${BucketPrefix}/*
+              - Sid: ReadArtifacts
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}/${BucketPrefix}/*
+
+        - PolicyName: EC2CrawlerLaunch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LaunchCrawler
+                Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:CreateTags
+                Resource: '*'
+              - Sid: PassCrawlerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CrawlerInstanceRole.Arn
+
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. IAM – EC2 crawler instance role
+  #    Each crawl job runs on a self-terminating EC2 instance with this role.
+  #    Needs: S3 write (artifacts), S3 read (crawl.py download),
+  #           DynamoDB write (status updates), EC2 self-terminate.
+  # ─────────────────────────────────────────────────────────────────────────
+  CrawlerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub screenweave-crawler-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Session Manager access (for debugging without SSH)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CrawlerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: UploadArtifacts
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}/${BucketPrefix}/*
+              - Sid: SyncArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${BucketPrefix}/*
+              - Sid: DownloadCrawlerScript
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${LambdaCodeBucket}/${BucketPrefix}/crawler/*
+              - Sid: WriteSessionStatus
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SessionsTable.Arn
+              - Sid: SelfTerminate
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  CrawlerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub screenweave-crawler-${Environment}
+      Roles:
+        - !Ref CrawlerInstanceRole
+
+  # Egress-only security group for crawler EC2 instances.
+  # No inbound rules needed — crawlers only call out to the web and AWS APIs.
+  CrawlerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ScreenWeave crawler EC2 – egress only, no inbound
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Lambda – McpServer (MCP protocol + all business logic)
+  # ─────────────────────────────────────────────────────────────────────────
+  McpServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/screenweave-mcp-${Environment}
+      RetentionInDays: 30
+
+  McpServerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: McpServerLogGroup
+    Properties:
+      FunctionName: !Sub screenweave-mcp-${Environment}
+      Description: >
+        ScreenWeave MCP server. Implements MCP JSON-RPC 2.0 over HTTP.
+        Tools: crawl_url, get_session_status, get_screenshots, get_metrics, get_full_session.
+        Called directly by MCP clients via API Gateway v2 — no AWS credentials required.
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt McpServerRole.Arn
+      # 29 s matches API Gateway v2 max integration timeout (30 s)
+      Timeout: 29
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          SESSIONS_TABLE:               !Ref SessionsTable
+          ARTIFACTS_BUCKET:             !Ref ArtifactsBucket
+          BUCKET_PREFIX:                !Ref BucketPrefix
+          CRAWLER_AMI_ID:               !Ref CrawlerAmiId
+          CRAWLER_SG_ID:                !Ref CrawlerSecurityGroup
+          CRAWLER_INSTANCE_PROFILE_ARN: !GetAtt CrawlerInstanceProfile.Arn
+          CRAWLER_INSTANCE_TYPE:        !Ref CrawlerInstanceType
+          LAMBDA_CODE_BUCKET:           !Ref LambdaCodeBucket
+          SIGNED_URL_EXPIRES_SECONDS:   !Ref SignedUrlExpiresSeconds
+          NODE_ENV:                     !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. API Gateway v2 – HTTP API
+  #
+  # Routes:
+  #   POST /mcp  →  McpServerFunction  (JSON-RPC request → SSE response)
+  #   GET  /mcp  →  McpServerFunction  (protocol negotiation / health)
+  #
+  # PayloadFormatVersion 2.0 surfaces requestContext.http.method, rawPath,
+  # isBase64Encoded etc. as used by the Lambda handler.
+  # ─────────────────────────────────────────────────────────────────────────
+  McpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub screenweave-mcp-${Environment}
+      Description: ScreenWeave MCP endpoint – JSON-RPC 2.0 over HTTP with SSE responses
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+          - accept
+        MaxAge: 300
+      Tags:
+        Project: ScreenWeave
+        Environment: !Ref Environment
+
+  McpIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref McpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt McpServerFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  PostMcpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpApi
+      RouteKey: POST /mcp
+      Target: !Sub integrations/${McpIntegration}
+
+  GetMcpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpApi
+      RouteKey: GET /mcp
+      Target: !Sub integrations/${McpIntegration}
+
+  McpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref McpApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+      AccessLogSettings:
+        DestinationArn: !GetAtt McpApiLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId",
+          "ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey",
+          "status":"$context.status",
+          "responseLatency":"$context.responseLatency",
+          "integrationLatency":"$context.integrationLatency",
+          "errorMessage":"$context.error.message"}
+      Tags:
+        Project: ScreenWeave
+        Environment: !Ref Environment
+
+  McpApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/screenweave-mcp-${Environment}
+      RetentionInDays: 30
+
+  McpLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt McpServerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${McpApi}/*
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  McpEndpoint:
+    Description: >
+      MCP server URL. Use as the "url" value in MCP client config.
+      No AWS credentials required — just this URL.
+    Value: !Sub https://${McpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/mcp
+    Export:
+      Name: !Sub ScreenWeave-McpEndpoint-${Environment}
+
+  McpClientConfig:
+    Description: Ready-to-paste MCP client configuration block
+    Value: !Sub >-
+      {"mcpServers":{"screenweave":{"url":"https://${McpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/mcp"}}}
+
+  SessionsTableName:
+    Description: DynamoDB session index table name
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub ScreenWeave-SessionsTable-${Environment}
+
+  SessionsTableArn:
+    Description: DynamoDB session index table ARN
+    Value: !GetAtt SessionsTable.Arn
+    Export:
+      Name: !Sub ScreenWeave-SessionsTableArn-${Environment}
+
+  McpServerFunctionName:
+    Description: McpServer Lambda function name
+    Value: !Ref McpServerFunction
+    Export:
+      Name: !Sub ScreenWeave-McpFunction-${Environment}
+
+  McpServerFunctionArn:
+    Description: McpServer Lambda function ARN
+    Value: !GetAtt McpServerFunction.Arn
+    Export:
+      Name: !Sub ScreenWeave-McpFunctionArn-${Environment}
+
+  CrawlerInstanceProfileArn:
+    Description: IAM instance profile ARN attached to EC2 crawler workers
+    Value: !GetAtt CrawlerInstanceProfile.Arn
+    Export:
+      Name: !Sub ScreenWeave-CrawlerProfile-${Environment}
+
+  CrawlerSecurityGroupId:
+    Description: Security group ID for EC2 crawler workers (egress only)
+    Value: !Ref CrawlerSecurityGroup
+    Export:
+      Name: !Sub ScreenWeave-CrawlerSG-${Environment}
+
+  ApiId:
+    Description: API Gateway v2 HTTP API ID
+    Value: !Ref McpApi
+    Export:
+      Name: !Sub ScreenWeave-ApiId-${Environment}
