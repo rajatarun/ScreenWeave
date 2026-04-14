@@ -1,0 +1,14 @@
+{
+  "name": "screenweave-start-crawl",
+  "version": "1.0.0",
+  "description": "ScreenWeave startCrawl Lambda – validates URL, registers session in DynamoDB, launches EC2 crawler",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.731.0",
+    "@aws-sdk/client-ec2": "^3.731.0",
+    "@aws-sdk/util-dynamodb": "^3.731.0"
+  }
+}

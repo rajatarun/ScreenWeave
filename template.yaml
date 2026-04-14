@@ -17,6 +17,13 @@ Parameters:
       Set this to the same value as BUCKET_PREFIX in the retrieval API stack
       (infra/api-stack.yaml) so the Lambda can locate them.
 
+  SessionsTable:
+    Type: String
+    Default: ""
+    Description: >
+      DynamoDB table name (screenweave_sessions_{env}) to write session status.
+      Leave empty to skip DynamoDB writes (standalone batch mode).
+
   TargetURL:
     Type: String
     Default: https://tarunraja.info
@@ -61,6 +68,12 @@ Resources:
                 Condition:
                   StringLike:
                     s3:prefix: !Sub "${S3Prefix}/*"
+              # Write session status + metrics to DynamoDB
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/screenweave_sessions_*"
               # Self-terminate when done
               - Effect: Allow
                 Action: [ec2:TerminateInstances]
@@ -97,6 +110,7 @@ Resources:
           S3_BUCKET="${S3Bucket}"
           S3_PREFIX="${S3Prefix}"
           TARGET_URL="${TargetURL}"
+          DYNAMO_TABLE="${SessionsTable}"
 
           # IMDSv2-compatible instance ID
           TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
@@ -127,8 +141,8 @@ Resources:
             at-spi2-atk at-spi2-core libdrm mesa-libgbm nss nspr \
             libxkbcommon libgbm xdg-utils
 
-          # ── 3. Playwright ──────────────────────────────────────────────────
-          pip3 install playwright
+          # ── 3. Playwright + boto3 ─────────────────────────────────────────
+          pip3 install playwright boto3
           python3 -m playwright install chromium
 
           # ── 4. Write crawler script ────────────────────────────────────────
@@ -376,7 +390,30 @@ Resources:
           echo "Crawler written: $(wc -l /opt/crawl.py | awk '{print $1}') lines"
 
           # ── 5. Run crawler ─────────────────────────────────────────────────
-          python3 /opt/crawl.py "$TARGET_URL"
+          # Pass DynamoDB config via env vars so crawl.py writes session status
+          export SCREENWEAVE_DYNAMO_TABLE="$DYNAMO_TABLE"
+          export SCREENWEAVE_S3_BUCKET="$S3_BUCKET"
+          export SCREENWEAVE_S3_PREFIX="$S3_PREFIX"
+          export SCREENWEAVE_REGION="$REGION"
+          export SCREENWEAVE_MAX_DEPTH="2"
+          export SCREENWEAVE_MAX_LINKS="12"
+
+          python3 /opt/crawl.py "$TARGET_URL" || {
+            echo "Crawler FAILED"
+            # Update DynamoDB to FAILED if table is configured
+            if [ -n "$DYNAMO_TABLE" ]; then
+              SESSION_ID=$(cat /opt/output/.session_id 2>/dev/null || echo "unknown")
+              aws dynamodb update-item \
+                --table-name "$DYNAMO_TABLE" \
+                --key "{\"session_id\":{\"S\":\"SESSION#$SESSION_ID\"}}" \
+                --update-expression "SET #s = :s, updated_at = :u" \
+                --expression-attribute-names '{"#s":"status"}' \
+                --expression-attribute-values "{\":s\":{\"S\":\"FAILED\"},\":u\":{\"S\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+                --region "$REGION" || true
+            fi
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+            exit 1
+          }
 
           # Read the session ID the Python script persisted to disk
           SESSION_ID=$(cat /opt/output/.session_id)
