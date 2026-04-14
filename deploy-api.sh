@@ -28,11 +28,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAMBDA_SRC="${SCRIPT_DIR}/src/lambda/getSession"
+GETSESSION_SRC="${SCRIPT_DIR}/src/lambda/getSession"
+STARTCRAWL_SRC="${SCRIPT_DIR}/src/lambda/startCrawl"
+CRAWLER_SRC="${SCRIPT_DIR}/src/crawler/crawl.py"
 INFRA_TEMPLATE="${SCRIPT_DIR}/infra/api-stack.yaml"
 BUILD_DIR="${SCRIPT_DIR}/.build"
 ZIP_NAME="getSession.zip"
 ZIP_PATH="${BUILD_DIR}/${ZIP_NAME}"
+STARTCRAWL_ZIP_NAME="startCrawl.zip"
+STARTCRAWL_ZIP_PATH="${BUILD_DIR}/${STARTCRAWL_ZIP_NAME}"
+STARTCRAWL_CODE_KEY="screenweave/lambda/${STARTCRAWL_ZIP_NAME}"
+CRAWLER_S3_KEY="screenweave/crawler/crawl.py"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 ENV="dev"
@@ -88,35 +94,43 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # ── Step 1: Build Lambda package ─────────────────────────────────────────────
 if [[ "$SKIP_BUILD" == "true" ]]; then
   echo ""
-  echo "[1/4] Skipping build (--skip-build set). Using existing ${ZIP_PATH}"
-  [[ ! -f "$ZIP_PATH" ]] && { echo "ERROR: ZIP not found at ${ZIP_PATH}"; exit 1; }
+  echo "[1/4] Skipping build (--skip-build set)."
+  [[ ! -f "$ZIP_PATH" ]]           && { echo "ERROR: ZIP not found at ${ZIP_PATH}"; exit 1; }
+  [[ ! -f "$STARTCRAWL_ZIP_PATH" ]] && { echo "ERROR: ZIP not found at ${STARTCRAWL_ZIP_PATH}"; exit 1; }
 else
   echo ""
-  echo "[1/4] Installing Lambda dependencies..."
-  pushd "${LAMBDA_SRC}" > /dev/null
+  echo "[1/4] Building Lambda packages..."
+  mkdir -p "${BUILD_DIR}"
+
+  # getSession Lambda
+  pushd "${GETSESSION_SRC}" > /dev/null
   npm ci --omit=dev --silent
   popd > /dev/null
-
-  echo "      Packaging Lambda ZIP..."
-  mkdir -p "${BUILD_DIR}"
   rm -f "${ZIP_PATH}"
-  pushd "${LAMBDA_SRC}" > /dev/null
-  zip -qr "${ZIP_PATH}" . \
-    --exclude "*.test.js" \
-    --exclude "*.spec.js" \
-    --exclude "*.md" \
-    --exclude ".npmrc"
+  pushd "${GETSESSION_SRC}" > /dev/null
+  zip -qr "${ZIP_PATH}" . --exclude "*.test.js" --exclude "*.md"
   popd > /dev/null
-  echo "      Done: ${ZIP_PATH} ($(du -sh "${ZIP_PATH}" | cut -f1))"
+  echo "      getSession:  ${ZIP_PATH} ($(du -sh "${ZIP_PATH}" | cut -f1))"
+
+  # startCrawl Lambda
+  pushd "${STARTCRAWL_SRC}" > /dev/null
+  npm ci --omit=dev --silent
+  popd > /dev/null
+  rm -f "${STARTCRAWL_ZIP_PATH}"
+  pushd "${STARTCRAWL_SRC}" > /dev/null
+  zip -qr "${STARTCRAWL_ZIP_PATH}" . --exclude "*.test.js" --exclude "*.md"
+  popd > /dev/null
+  echo "      startCrawl:  ${STARTCRAWL_ZIP_PATH} ($(du -sh "${STARTCRAWL_ZIP_PATH}" | cut -f1))"
 fi
 
-# ── Step 2: Upload ZIP to S3 ─────────────────────────────────────────────────
+# ── Step 2: Upload ZIPs + crawler script to S3 ───────────────────────────────
 echo ""
-echo "[2/4] Uploading Lambda ZIP to S3..."
-aws s3 cp "${ZIP_PATH}" "s3://${CODE_BUCKET}/${LAMBDA_CODE_KEY}" \
-  --region "${REGION}" \
-  --sse AES256
-echo "      Uploaded: s3://${CODE_BUCKET}/${LAMBDA_CODE_KEY}"
+echo "[2/4] Uploading to S3..."
+aws s3 cp "${ZIP_PATH}"           "s3://${CODE_BUCKET}/${LAMBDA_CODE_KEY}"    --region "${REGION}" --sse AES256
+aws s3 cp "${STARTCRAWL_ZIP_PATH}" "s3://${CODE_BUCKET}/${STARTCRAWL_CODE_KEY}" --region "${REGION}" --sse AES256
+# crawl.py is downloaded by EC2 crawler workers at runtime
+aws s3 cp "${CRAWLER_SRC}"        "s3://${CODE_BUCKET}/${CRAWLER_S3_KEY}"     --region "${REGION}" --sse AES256
+echo "      Uploaded: getSession, startCrawl ZIPs + crawl.py"
 
 # ── Step 3: Deploy / update CloudFormation stack ─────────────────────────────
 echo ""
@@ -130,6 +144,7 @@ aws cloudformation deploy \
     "BucketPrefix=${BUCKET_PREFIX}" \
     "LambdaCodeBucket=${CODE_BUCKET}" \
     "LambdaCodeKey=${LAMBDA_CODE_KEY}" \
+    "StartCrawlCodeKey=${STARTCRAWL_CODE_KEY}" \
     "SignedUrlExpiresSeconds=${SIGNED_URL_EXPIRES}" \
     "Environment=${ENV}" \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -141,19 +156,18 @@ aws cloudformation deploy \
 # latest ZIP is always deployed.
 echo ""
 echo "[4/4] Forcing Lambda code refresh..."
-FUNCTION_NAME="screenweave-get-session-${ENV}"
-aws lambda update-function-code \
-  --region "${REGION}" \
-  --function-name "${FUNCTION_NAME}" \
-  --s3-bucket "${CODE_BUCKET}" \
-  --s3-key "${LAMBDA_CODE_KEY}" \
-  --query "FunctionArn" \
-  --output text
-
-# Wait for the update to complete before querying outputs
-aws lambda wait function-updated \
-  --region "${REGION}" \
-  --function-name "${FUNCTION_NAME}"
+for FN_NAME in "screenweave-get-session-${ENV}" "screenweave-start-crawl-${ENV}"; do
+  FN_KEY="${LAMBDA_CODE_KEY}"
+  [[ "$FN_NAME" == *"start-crawl"* ]] && FN_KEY="${STARTCRAWL_CODE_KEY}"
+  aws lambda update-function-code \
+    --region "${REGION}" \
+    --function-name "${FN_NAME}" \
+    --s3-bucket "${CODE_BUCKET}" \
+    --s3-key "${FN_KEY}" \
+    --query "FunctionArn" --output text
+  aws lambda wait function-updated --region "${REGION}" --function-name "${FN_NAME}"
+  echo "      Refreshed: ${FN_NAME}"
+done
 
 # ── Print deployment summary ─────────────────────────────────────────────────
 echo ""
@@ -187,13 +201,28 @@ echo "  DynamoDB Table : ${TABLE_NAME}"
 echo "  API Key ID     : ${API_KEY_ID}"
 echo "  API Key Value  : ${API_KEY_VALUE}"
 echo ""
-echo "  Example request:"
-echo "    curl -s \\"
+echo "  Trigger a crawl:"
+echo "    curl -s -X POST \\"
 echo "      -H 'x-api-key: ${API_KEY_VALUE}' \\"
+echo "      -H 'content-type: application/json' \\"
+echo "      -d '{\"url\":\"https://example.com\",\"max_depth\":2}' \\"
+echo "      '${API_ENDPOINT}/session' | jq ."
+echo ""
+echo "  Poll until COMPLETED, then get results:"
+echo "    curl -s -H 'x-api-key: ${API_KEY_VALUE}' \\"
 echo "      '${API_ENDPOINT}/session/{session_id}' | jq ."
 echo ""
-echo "  Partial retrieval:"
-echo "    curl -s \\"
-echo "      -H 'x-api-key: ${API_KEY_VALUE}' \\"
-echo "      '${API_ENDPOINT}/session/{session_id}?include=screenshots,states' | jq ."
+echo "  MCP server config (claude_desktop_config.json / .cursor/mcp.json):"
+echo "    {"
+echo "      \"mcpServers\": {"
+echo "        \"screenweave\": {"
+echo "          \"command\": \"node\","
+echo "          \"args\": [\"$(pwd)/src/mcp-server/index.js\"],"
+echo "          \"env\": {"
+echo "            \"SCREENWEAVE_API_URL\": \"${API_ENDPOINT}\","
+echo "            \"SCREENWEAVE_API_KEY\": \"${API_KEY_VALUE}\""
+echo "          }"
+echo "        }"
+echo "      }"
+echo "    }"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
