@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ScreenWeave – Serverless Artifact Retrieval API.
+  Provisions a DynamoDB session index, Lambda retrieval function, and
+  API Gateway endpoint (GET /session/{session_id}).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ArtifactsBucket:
+    Type: String
+    Description: >
+      Name of the existing S3 bucket that stores Playwright artifacts
+      (created and written by the crawler stack).
+
+  BucketPrefix:
+    Type: String
+    Default: screenweave
+    Description: >
+      Root S3 key prefix under which all session artifacts live.
+      Structure: {BucketPrefix}/{session_id}/[states.json|transitions.json|trace.zip|screenshots/]
+
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      S3 bucket that holds the packaged Lambda ZIP produced by deploy-api.sh.
+
+  LambdaCodeKey:
+    Type: String
+    Default: screenweave/lambda/getSession.zip
+    Description: S3 key of the packaged Lambda ZIP.
+
+  SignedUrlExpiresSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 43200
+    Description: Pre-signed URL TTL in seconds (5 min – 12 hrs). Default 1 hr.
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment label used in resource names.
+
+  ApiDailyQuota:
+    Type: Number
+    Default: 10000
+    Description: Maximum API requests per day for the default API key.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ───────────────────────────────────────────────
+  # 1. DynamoDB: Session Metadata Index
+  #
+  # Schema
+  # ──────
+  # PK  session_id  (String)  Value format: "SESSION#{session_id}"
+  #
+  # Standard attributes written by the crawler:
+  #   status           String   RUNNING | COMPLETED | FAILED
+  #   created_at       String   ISO-8601 timestamp
+  #   updated_at       String   ISO-8601 timestamp
+  #   ttl              Number   Unix epoch for TTL-based expiry (optional)
+  #
+  # Optional enrichment attributes:
+  #   artifact_manifest  Map    { "<state_id>": { "url": "...", "timestamp": "..." } }
+  #   summary_stats      Map    { "total_states": N, "duration_seconds": N, ... }
+  #
+  # This table is an INDEX only. Full artifacts live in S3.
+  # ───────────────────────────────────────────────
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub screenweave_sessions_${Environment}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      # TTL on optional 'ttl' attribute – allows automatic expiry of old sessions
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: metadata-index
+
+  # ───────────────────────────────────────────────
+  # 2. IAM: Lambda Execution Role (least-privilege)
+  # ───────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub screenweave-lambda-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Grants CloudWatch Logs write access only
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # X-Ray tracing
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBSessionRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetSessionItem
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt SessionsTable.Arn
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListSessionArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${BucketPrefix}/*
+              - Sid: GetArtifactObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}/${BucketPrefix}/*
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ───────────────────────────────────────────────
+  # 3. CloudWatch Log Group (explicit retention)
+  # ───────────────────────────────────────────────
+  GetSessionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/screenweave-get-session-${Environment}
+      RetentionInDays: 30
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/screenweave-${Environment}/access
+      RetentionInDays: 30
+
+  # ───────────────────────────────────────────────
+  # 4. Lambda: Artifact Retrieval Function
+  # ───────────────────────────────────────────────
+  GetSessionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetSessionLogGroup
+    Properties:
+      FunctionName: !Sub screenweave-get-session-${Environment}
+      Description: >
+        Returns structured MCP artifact bundles for a given Playwright session_id.
+        Queries DynamoDB for metadata and generates pre-signed S3 URLs for all
+        artifacts (screenshots, states, transitions, trace).
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      # Prevent runaway concurrency during traffic spikes
+      ReservedConcurrentExecutions: 50
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          BUCKET_PREFIX: !Ref BucketPrefix
+          SIGNED_URL_EXPIRES_SECONDS: !Ref SignedUrlExpiresSeconds
+          NODE_ENV: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ───────────────────────────────────────────────
+  # 5. API Gateway REST API
+  # ───────────────────────────────────────────────
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub screenweave-api-${Environment}
+      Description: ScreenWeave artifact retrieval API – GET /session/{session_id}
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: ScreenWeave
+        - Key: Environment
+          Value: !Ref Environment
+
+  # /session
+  SessionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: session
+
+  # /session/{session_id}
+  SessionIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref SessionResource
+      PathPart: '{session_id}'
+
+  # Validates that session_id path param is present
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: path-params-validator
+      ValidateRequestBody: false
+      ValidateRequestParameters: true
+
+  # GET /session/{session_id}
+  GetSessionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref SessionIdResource
+      HttpMethod: GET
+      # Auth is enforced via API Key + Usage Plan (see below).
+      # For IAM or Cognito auth, change AuthorizationType and add AuthorizerId.
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.session_id: true
+        method.request.querystring.include: false
+      RequestValidatorId: !Ref RequestValidator
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt GetSessionFunction.Arn
+        # Slightly under Lambda timeout to guarantee API GW returns a response
+        TimeoutInMillis: 29000
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: '400'
+        - StatusCode: '404'
+        - StatusCode: '500'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GetSessionFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/*/GET/session/*
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: GetSessionMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub ScreenWeave ${Environment} deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiAccessLogGroup
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub ScreenWeave ${Environment} stage
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId",
+          "ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "routeKey":"$context.resourcePath",
+          "status":"$context.status",
+          "responseLatency":"$context.responseLatency",
+          "integrationLatency":"$context.integrationLatency",
+          "errorMessage":"$context.error.message",
+          "apiKeyId":"$context.identity.apiKeyId"}
+      MethodSettings:
+        - ResourcePath: /session/{session_id}
+          HttpMethod: GET
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+          LoggingLevel: INFO
+          MetricsEnabled: true
+          # Disable full request/response data tracing in production
+          DataTraceEnabled: false
+
+  # ───────────────────────────────────────────────
+  # 6. API Key + Usage Plan
+  #    (replace with Cognito / IAM auth for stricter control)
+  # ───────────────────────────────────────────────
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub screenweave-${Environment}
+      Description: ScreenWeave API usage plan – throttling + daily quota
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: !Ref ApiDailyQuota
+        Period: DAY
+
+  DefaultApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub screenweave-default-${Environment}
+      Description: Default consumer API key for ScreenWeave artifact retrieval
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref Environment
+
+  DefaultApiKeyUsagePlan:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref DefaultApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  ApiEndpoint:
+    Description: Base URL for the ScreenWeave Artifact Retrieval API
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ScreenWeave-ApiEndpoint-${Environment}
+
+  ExampleRequest:
+    Description: Example endpoint for retrieving a session
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/session/{session_id}
+
+  SessionsTableName:
+    Description: DynamoDB session index table name
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub ScreenWeave-SessionsTable-${Environment}
+
+  SessionsTableArn:
+    Description: DynamoDB session index table ARN
+    Value: !GetAtt SessionsTable.Arn
+    Export:
+      Name: !Sub ScreenWeave-SessionsTableArn-${Environment}
+
+  GetSessionFunctionName:
+    Description: Lambda function name
+    Value: !Ref GetSessionFunction
+    Export:
+      Name: !Sub ScreenWeave-GetSessionFunction-${Environment}
+
+  GetSessionFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt GetSessionFunction.Arn
+    Export:
+      Name: !Sub ScreenWeave-GetSessionFunctionArn-${Environment}
+
+  ApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub ScreenWeave-ApiId-${Environment}
+
+  DefaultApiKeyId:
+    Description: >
+      Default API Key resource ID. Retrieve the actual key value via:
+      aws apigateway get-api-key --api-key <KeyId> --include-value
+    Value: !Ref DefaultApiKey
