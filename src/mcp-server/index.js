@@ -2,75 +2,117 @@
 /**
  * ScreenWeave MCP Server
  * ======================
- * Exposes Playwright crawl, screenshot retrieval, and page metrics as MCP tools
- * so that any AI agent (Claude, Cursor, etc.) can invoke them.
+ * Exposes Playwright crawl, screenshot retrieval, and page metrics as MCP tools.
+ * Communicates with AWS Lambda DIRECTLY via the AWS SDK (IAM auth) — API Gateway
+ * is NOT in the data path. API Gateway is only the MCP protocol endpoint for
+ * agents that cannot run this server locally.
  *
- * Transport: stdio  (add to Claude Desktop / Cursor via config — see README)
+ * Transport: stdio
  *
  * Required environment variables:
- *   SCREENWEAVE_API_URL   Base URL of the deployed API Gateway stage
- *                         e.g. https://abc123.execute-api.us-east-1.amazonaws.com/prod
- *   SCREENWEAVE_API_KEY   Value of the API key (x-api-key header)
+ *   AWS_REGION               AWS region where Lambdas are deployed
+ *   START_CRAWL_FUNCTION     Lambda function name for startCrawl
+ *   GET_SESSION_FUNCTION     Lambda function name for getSession
  *
- * Tools exposed:
- *   crawl_url           – Start a new Playwright crawl for a given URL
- *   get_session_status  – Check whether a crawl has completed
- *   get_screenshots     – Get signed screenshot URLs for every captured state
- *   get_metrics         – Get computed page metrics (states, transitions, coverage)
- *   get_full_session    – Get the full artifact bundle (screenshots + states + transitions)
+ * AWS credentials are resolved via the standard SDK chain:
+ *   1. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars
+ *   2. ~/.aws/credentials profile
+ *   3. EC2/ECS/Lambda IAM role (if running on AWS)
+ *
+ * The IAM principal running this server needs:
+ *   lambda:InvokeFunction on START_CRAWL_FUNCTION and GET_SESSION_FUNCTION
+ *
+ * MCP client config (claude_desktop_config.json / .cursor/mcp.json):
+ * {
+ *   "mcpServers": {
+ *     "screenweave": {
+ *       "command": "node",
+ *       "args": ["/path/to/src/mcp-server/index.js"],
+ *       "env": {
+ *         "AWS_REGION": "us-east-1",
+ *         "START_CRAWL_FUNCTION": "screenweave-start-crawl-prod",
+ *         "GET_SESSION_FUNCTION": "screenweave-get-session-prod"
+ *       }
+ *     }
+ *   }
+ * }
  */
 
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const API_URL = (process.env.SCREENWEAVE_API_URL || '').replace(/\/$/, '');
-const API_KEY = process.env.SCREENWEAVE_API_KEY || '';
+const REGION               = process.env.AWS_REGION || 'us-east-1';
+const START_CRAWL_FUNCTION = process.env.START_CRAWL_FUNCTION;
+const GET_SESSION_FUNCTION = process.env.GET_SESSION_FUNCTION;
 
-if (!API_URL || !API_KEY) {
+if (!START_CRAWL_FUNCTION || !GET_SESSION_FUNCTION) {
   process.stderr.write(
-    '[screenweave-mcp] ERROR: SCREENWEAVE_API_URL and SCREENWEAVE_API_KEY must be set.\n'
+    '[screenweave-mcp] ERROR: START_CRAWL_FUNCTION and GET_SESSION_FUNCTION must be set.\n'
   );
   process.exit(1);
 }
 
-// ── API helpers ───────────────────────────────────────────────────────────────
+// ── Lambda client (reused across tool calls) ──────────────────────────────────
+const lambda = new LambdaClient({ region: REGION });
 
-/** POST JSON to the API Gateway. */
-async function apiPost(path, body) {
-  const res = await fetch(`${API_URL}${path}`, {
-    method: 'POST',
-    headers: { 'x-api-key': API_KEY, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-  return json;
-}
+// ── Lambda invocation helpers ─────────────────────────────────────────────────
 
-/** GET from the API Gateway with optional query params. */
-async function apiGet(path, params = {}) {
-  const qs = new URLSearchParams(params).toString();
-  const url = `${API_URL}${path}${qs ? `?${qs}` : ''}`;
-  const res = await fetch(url, { headers: { 'x-api-key': API_KEY } });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-  return json;
+/**
+ * Invoke a Lambda function synchronously and return its parsed payload.
+ * The Lambdas are dual-mode: when called directly (not via API Gateway) they
+ * accept a plain JSON payload and return plain JSON (not the APIGateway proxy
+ * envelope). See each Lambda's handler for the dual-mode detection logic.
+ *
+ * Throws if the function returns a FunctionError (unhandled exception in Lambda).
+ */
+async function invokeLambda(functionName, payload) {
+  const result = await lambda.send(
+    new InvokeCommand({
+      FunctionName:   functionName,
+      InvocationType: 'RequestResponse',
+      Payload:        JSON.stringify(payload),
+    })
+  );
+
+  const responseText = new TextDecoder().decode(result.Payload);
+  const response     = JSON.parse(responseText);
+
+  if (result.FunctionError) {
+    // Lambda threw an unhandled exception
+    const msg = response.errorMessage || response.message || 'Lambda invocation failed';
+    throw new Error(`${functionName}: ${msg}`);
+  }
+
+  // Lambdas signal application-level errors via { error: "..." }
+  if (response && response.error) {
+    throw new Error(response.error);
+  }
+
+  return response;
 }
 
 /**
- * Fetch states.json from the signed S3 URL returned by the retrieval API.
- * Used by get_metrics to compute derived metrics without needing a dedicated endpoint.
+ * Fetch states.json from a pre-signed S3 URL returned by getSession.
+ * This is an S3 call, NOT an API Gateway call — the signed URL bypasses
+ * API Gateway entirely.
  */
 async function fetchStatesJson(signedUrl) {
-  if (!signedUrl) throw new Error('states_json URL is not available for this session');
+  if (!signedUrl) throw new Error('states_json signed URL is not available for this session');
   const res = await fetch(signedUrl);
   if (!res.ok) throw new Error(`Failed to fetch states.json: HTTP ${res.status}`);
   return res.json();
 }
 
-/** Build a uniform tool error response. */
+// ── Uniform tool response helpers ─────────────────────────────────────────────
+function toolOk(data) {
+  return {
+    content: [{ type: 'text', text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }],
+  };
+}
+
 function toolError(err) {
   return {
     content: [{ type: 'text', text: `Error: ${err.message}` }],
@@ -78,59 +120,39 @@ function toolError(err) {
   };
 }
 
-/** Build a uniform tool success response. */
-function toolOk(data) {
-  return {
-    content: [{ type: 'text', text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }],
-  };
-}
-
 // ── MCP server ────────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: 'screenweave',
-  version: '1.0.0',
-});
+const server = new McpServer({ name: 'screenweave', version: '1.0.0' });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool 1: crawl_url
+// Directly invokes the startCrawl Lambda.
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
   'crawl_url',
   `Start a Playwright crawl for the given URL. The crawler visits the page, scrolls to
 reveal lazy-loaded content, clicks every interactive element (tabs, accordions, buttons),
-and recursively follows internal links up to max_depth. For each distinct visual state
-it captures a full-page screenshot and structured metadata (headings, links, visible text).
+and follows internal links up to max_depth. For each distinct visual state it captures a
+full-page screenshot and structured metadata (headings, links, visible text).
 
-Returns a session_id immediately. The crawl runs asynchronously on a cloud worker
-(EC2/Fargate). Use get_session_status to poll for completion, then get_screenshots or
-get_metrics to retrieve results.
-
-Typical completion time: 3–10 minutes depending on site complexity.`,
+Invokes the startCrawl Lambda directly via IAM — no API Gateway in the path.
+Returns a session_id immediately; crawl runs asynchronously on EC2.
+Poll get_session_status until COMPLETED, then call get_screenshots or get_metrics.`,
   {
-    url: z.string().url().describe('The URL to crawl (must be https://)'),
-    max_depth: z
-      .number()
-      .int()
-      .min(0)
-      .max(3)
-      .default(2)
-      .describe('How many link hops to follow from the root URL (0 = root page only)'),
-    max_links: z
-      .number()
-      .int()
-      .min(1)
-      .max(30)
-      .default(12)
+    url: z.string().url().describe('The URL to crawl (must be http/https)'),
+    max_depth: z.number().int().min(0).max(3).default(2)
+      .describe('Link recursion depth (0 = root page only)'),
+    max_links: z.number().int().min(1).max(30).default(12)
       .describe('Max child links to follow per page'),
   },
   async ({ url, max_depth, max_links }) => {
     try {
-      const result = await apiPost('/session', { url, max_depth, max_links });
+      // Direct Lambda invocation — plain payload, no API Gateway envelope
+      const result = await invokeLambda(START_CRAWL_FUNCTION, { url, max_depth, max_links });
       return toolOk({
         session_id: result.session_id,
-        status: result.status,
-        message: `Crawl started. Poll get_session_status(session_id="${result.session_id}") until status is COMPLETED, then call get_screenshots or get_metrics.`,
+        status:     result.status,
         target_url: url,
+        message:    `Crawl started. Poll get_session_status(session_id="${result.session_id}") until COMPLETED.`,
       });
     } catch (err) {
       return toolError(err);
@@ -140,24 +162,28 @@ Typical completion time: 3–10 minutes depending on site complexity.`,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool 2: get_session_status
+// Directly invokes the getSession Lambda (metadata only, no S3 listing).
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
   'get_session_status',
-  `Check the status of a crawl session. Returns RUNNING, COMPLETED, or FAILED.
-Poll every 30–60 seconds after calling crawl_url. Once COMPLETED, call
-get_screenshots or get_metrics.`,
+  `Check the status of a crawl session (RUNNING, COMPLETED, FAILED).
+Invokes the getSession Lambda directly via IAM.
+Poll every 30–60 seconds after crawl_url. Once COMPLETED, call get_screenshots or get_metrics.`,
   {
     session_id: z.string().describe('Session ID returned by crawl_url'),
   },
   async ({ session_id }) => {
     try {
-      // Retrieve only the lightweight metadata (no S3 listing needed)
-      const result = await apiGet(`/session/${session_id}`, { include: 'none' });
+      // include=none → DynamoDB lookup only, no S3 listing
+      const result = await invokeLambda(GET_SESSION_FUNCTION, {
+        session_id,
+        include: 'none',
+      });
       return toolOk({
-        session_id: result.session_id,
-        status: result.status,
-        created_at: result.metadata?.created_at,
-        updated_at: result.metadata?.updated_at,
+        session_id:    result.session_id,
+        status:        result.status,
+        created_at:    result.metadata?.created_at  ?? null,
+        updated_at:    result.metadata?.updated_at  ?? null,
         summary_stats: result.metadata?.summary_stats ?? null,
       });
     } catch (err) {
@@ -168,24 +194,29 @@ get_screenshots or get_metrics.`,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool 3: get_screenshots
+// Directly invokes getSession Lambda with include=screenshots.
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
   'get_screenshots',
   `Get pre-signed HTTPS URLs for every screenshot captured during a crawl session.
-Each entry maps a state_id to the URL and page context that triggered it.
-URLs expire after 1 hour. Call this after get_session_status returns COMPLETED.`,
+Invokes the getSession Lambda directly via IAM — URLs come from S3, not API Gateway.
+Each entry maps a state_id to its signed URL and the page context that triggered it.
+URLs expire after 1 hour. Call after get_session_status returns COMPLETED.`,
   {
     session_id: z.string().describe('Session ID returned by crawl_url'),
   },
   async ({ session_id }) => {
     try {
-      const result = await apiGet(`/session/${session_id}`, { include: 'screenshots' });
+      const result = await invokeLambda(GET_SESSION_FUNCTION, {
+        session_id,
+        include: 'screenshots',
+      });
 
       if (!result.artifacts?.screenshots?.length) {
-        return toolOk({ message: 'No screenshots found. Check get_session_status first.', session_id });
+        return toolOk({ message: 'No screenshots yet. Check get_session_status first.', session_id });
       }
 
-      // Enrich with state metadata from indexed_states
+      // Enrich screenshot entries with state metadata from indexed_states
       const stateIndex = Object.fromEntries(
         (result.indexed_states || []).map((s) => [s.state_id, s])
       );
@@ -193,17 +224,17 @@ URLs expire after 1 hour. Call this after get_session_status returns COMPLETED.`
       const screenshots = result.artifacts.screenshots.map((shot) => {
         const meta = stateIndex[shot.state_id] || {};
         return {
-          state_id: shot.state_id,
+          state_id:  shot.state_id,
           https_url: shot.https_url,
-          page_url: meta.url || '',
+          page_url:  meta.url       || '',
           timestamp: meta.timestamp || '',
-          s3_uri: shot.s3_url,
+          s3_uri:    shot.s3_url,
         };
       });
 
       return toolOk({
         session_id,
-        status: result.status,
+        status:            result.status,
         total_screenshots: screenshots.length,
         screenshots,
       });
@@ -215,30 +246,36 @@ URLs expire after 1 hour. Call this after get_session_status returns COMPLETED.`
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool 4: get_metrics
+// Invokes getSession Lambda to get the states.json signed URL, then fetches
+// states.json directly from S3 (signed URL) and computes metrics client-side.
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
   'get_metrics',
-  `Get computed page metrics for a completed crawl session. Fetches states.json from S3,
-then derives:
-  - Session summary (total states, unique pages, duration)
-  - State coverage by action type (navigation / scroll / click)
-  - Content analysis (heading distribution, links found, interactive elements)
-  - Per-state summary list for quick overview
+  `Get computed page metrics for a completed crawl session.
+Invokes the getSession Lambda directly to get the states.json pre-signed S3 URL,
+then fetches and parses states.json from S3 (direct, not via API Gateway).
 
-Use this when you need to understand the site structure or validate QA coverage.`,
+Computed metrics:
+  - Session summary: total states, unique pages visited, duration
+  - Coverage: states by action type (navigation / scroll / click)
+  - Content: heading distribution, unique links, interactive elements
+  - Per-state table for QA review`,
   {
     session_id: z.string().describe('Session ID returned by crawl_url'),
   },
   async ({ session_id }) => {
     try {
-      // Get the states_json signed URL from the retrieval API
-      const apiResult = await apiGet(`/session/${session_id}`, { include: 'states' });
+      // Step 1: get the states_json signed URL via direct Lambda invocation
+      const apiResult = await invokeLambda(GET_SESSION_FUNCTION, {
+        session_id,
+        include: 'states',
+      });
 
       if (apiResult.status !== 'COMPLETED') {
         return toolOk({
           session_id,
-          status: apiResult.status,
-          message: `Crawl is ${apiResult.status}. Metrics are only available after COMPLETED.`,
+          status:  apiResult.status,
+          message: `Crawl is ${apiResult.status}. Metrics available after COMPLETED.`,
         });
       }
 
@@ -246,7 +283,7 @@ Use this when you need to understand the site structure or validate QA coverage.
         return toolOk({ session_id, message: 'states.json not available for this session.' });
       }
 
-      // Fetch and parse states.json from S3
+      // Step 2: fetch states.json directly from S3 via the pre-signed URL
       const statesData = await fetchStatesJson(apiResult.artifacts.states_json);
       const states = statesData.states || [];
 
@@ -256,22 +293,20 @@ Use this when you need to understand the site structure or validate QA coverage.
 
       // ── Compute metrics ────────────────────────────────────────────────────
       const timestamps = states.map((s) => s.timestamp).filter(Boolean).sort();
-      const firstTs = timestamps[0] || null;
-      const lastTs  = timestamps[timestamps.length - 1] || null;
+      const firstTs    = timestamps[0] || null;
+      const lastTs     = timestamps[timestamps.length - 1] || null;
       const durationSec = firstTs && lastTs
         ? Math.round((new Date(lastTs) - new Date(firstTs)) / 1000)
         : null;
 
       const uniqueUrls = [...new Set(states.map((s) => s.url))];
 
-      // States by action type
       const byAction = {};
       for (const s of states) {
         const a = s.trigger_action || 'unknown';
         byAction[a] = (byAction[a] || 0) + 1;
       }
 
-      // Heading distribution
       const headingCounts = { h1: 0, h2: 0, h3: 0 };
       for (const s of states) {
         for (const h of s.headings || []) {
@@ -279,7 +314,6 @@ Use this when you need to understand the site structure or validate QA coverage.
         }
       }
 
-      // Unique interactive element labels
       const allInteractive = new Set();
       for (const s of states) {
         for (const el of s.interactive_elements || []) {
@@ -287,29 +321,15 @@ Use this when you need to understand the site structure or validate QA coverage.
         }
       }
 
-      // Total unique links found across all states
       const allLinks = new Set();
       for (const s of states) {
         for (const l of s.links_found || []) allLinks.add(l);
       }
 
-      // Average document height
       const heights = states.map((s) => s.document_height || 0).filter((h) => h > 0);
       const avgHeight = heights.length
         ? Math.round(heights.reduce((a, b) => a + b, 0) / heights.length)
         : 0;
-
-      // Per-state summary (compact, for agent overview)
-      const statesSummary = states.map((s) => ({
-        state_id:       s.state_id,
-        url:            s.url,
-        title:          s.title,
-        trigger_action: s.trigger_action,
-        trigger_label:  s.trigger_label,
-        timestamp:      s.timestamp,
-        headings_count: (s.headings || []).length,
-        links_count:    (s.links_found || []).length,
-      }));
 
       return toolOk({
         session_id,
@@ -323,17 +343,26 @@ Use this when you need to understand the site structure or validate QA coverage.
           last_captured_at:         lastTs,
         },
         coverage: {
-          unique_urls:     uniqueUrls,
+          unique_urls:      uniqueUrls,
           states_by_action: byAction,
         },
         content: {
-          heading_distribution:          headingCounts,
-          total_unique_links_found:      allLinks.size,
-          total_unique_interactive_elements: allInteractive.size,
-          interactive_element_labels:    [...allInteractive].slice(0, 30),
-          avg_document_height_px:        avgHeight,
+          heading_distribution:               headingCounts,
+          total_unique_links_found:           allLinks.size,
+          total_unique_interactive_elements:  allInteractive.size,
+          interactive_element_labels:         [...allInteractive].slice(0, 30),
+          avg_document_height_px:             avgHeight,
         },
-        states_summary: statesSummary,
+        states_summary: states.map((s) => ({
+          state_id:       s.state_id,
+          url:            s.url,
+          title:          s.title,
+          trigger_action: s.trigger_action,
+          trigger_label:  s.trigger_label,
+          timestamp:      s.timestamp,
+          headings_count: (s.headings || []).length,
+          links_count:    (s.links_found || []).length,
+        })),
       });
     } catch (err) {
       return toolError(err);
@@ -343,24 +372,24 @@ Use this when you need to understand the site structure or validate QA coverage.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool 5: get_full_session
+// Directly invokes getSession Lambda with the requested include set.
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
   'get_full_session',
-  `Get the complete artifact bundle for a crawl session: screenshots, states metadata,
-transitions graph, and trace file. Use the include parameter to request only what you
-need and reduce response size.
-
-All URLs are pre-signed S3 links that expire in 1 hour.`,
+  `Get the complete artifact bundle for a crawl session.
+Invokes the getSession Lambda directly via IAM — all signed URLs come from S3.
+Use the include parameter to request only what you need.`,
   {
     session_id: z.string().describe('Session ID returned by crawl_url'),
     include: z
       .array(z.enum(['screenshots', 'states', 'transitions', 'trace']))
       .default(['screenshots', 'states', 'transitions', 'trace'])
-      .describe('Which artifact types to include in the response'),
+      .describe('Artifact types to include'),
   },
   async ({ session_id, include }) => {
     try {
-      const result = await apiGet(`/session/${session_id}`, {
+      const result = await invokeLambda(GET_SESSION_FUNCTION, {
+        session_id,
         include: include.join(','),
       });
       return toolOk(result);
@@ -373,4 +402,4 @@ All URLs are pre-signed S3 links that expire in 1 hour.`,
 // ── Start server ──────────────────────────────────────────────────────────────
 const transport = new StdioServerTransport();
 await server.connect(transport);
-process.stderr.write('[screenweave-mcp] Server running (stdio)\n');
+process.stderr.write('[screenweave-mcp] Server running (stdio) — Lambda direct invoke mode\n');

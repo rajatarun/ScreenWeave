@@ -3,27 +3,32 @@
 /**
  * ScreenWeave – startCrawl Lambda
  *
- * POST /session
- * Body: { url: string, max_depth?: number, max_links?: number }
+ * Dual-mode: invocable from API Gateway (POST /session) OR directly from the
+ * MCP server via the AWS SDK (IAM auth, no API Gateway in the path).
  *
+ * API Gateway mode  – event.body is a JSON string: '{"url":"...","max_depth":2}'
+ * Direct mode       – event is a plain object:     { url: "...", max_depth: 2 }
+ *
+ * Returns:
+ *   API Gateway mode  → { statusCode: 202, body: "{...}" }
+ *   Direct mode       → plain object { session_id, status, ... }
+ *                       (or throws on error → Lambda FunctionError to MCP server)
+ *
+ * Steps:
  * 1. Validates the URL
  * 2. Generates a session_id (UUID v4)
  * 3. Writes session record to DynamoDB with status RUNNING
  * 4. Launches an EC2 instance whose UserData runs the Playwright crawler
- * 5. Returns { session_id, status: "RUNNING" }
- *
- * The crawler self-terminates after uploading artifacts and updating DynamoDB
- * to COMPLETED (or FAILED).
+ * 5. Returns { session_id, status: "RUNNING", instance_id }
  *
  * Required environment variables:
- *   SESSIONS_TABLE        DynamoDB table name
- *   ARTIFACTS_BUCKET      S3 bucket for artifacts
- *   BUCKET_PREFIX         S3 key prefix (default: screenweave)
- *   CRAWLER_AMI_ID        AMI for the crawler EC2 instance (AL2023)
- *   CRAWLER_SG_ID         Security group ID (egress-only)
- *   CRAWLER_INSTANCE_PROFILE_ARN  IAM instance profile ARN
- *   CRAWLER_INSTANCE_TYPE EC2 instance type (default: t3.medium)
- *   AWS_REGION / AWS_DEFAULT_REGION
+ *   SESSIONS_TABLE               DynamoDB table name
+ *   ARTIFACTS_BUCKET             S3 bucket for artifacts
+ *   BUCKET_PREFIX                S3 key prefix (default: screenweave)
+ *   CRAWLER_AMI_ID               AMI for EC2 crawler (AL2023)
+ *   CRAWLER_SG_ID                Security group ID (egress-only)
+ *   CRAWLER_INSTANCE_PROFILE_ARN IAM instance profile ARN
+ *   CRAWLER_INSTANCE_TYPE        EC2 instance type (default: t3.medium)
  */
 
 const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
@@ -50,29 +55,42 @@ const MAX_LINKS_LIMIT  = 30;
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
+  // Detect invocation source.
+  // API Gateway sends event.body (string); direct Lambda invocation sends a plain object.
+  const isApiGateway = event.httpMethod !== undefined || event.requestContext !== undefined;
+
   try {
-    // ── Parse body ───────────────────────────────────────────────────────────
+    // ── Parse payload ────────────────────────────────────────────────────────
     let body;
-    try {
-      body = typeof event.body === 'string' ? JSON.parse(event.body) : (event.body || {});
-    } catch {
-      return response(400, { error: 'Request body must be valid JSON' });
+    if (isApiGateway) {
+      try {
+        body = typeof event.body === 'string' ? JSON.parse(event.body) : (event.body || {});
+      } catch {
+        return response(400, { error: 'Request body must be valid JSON' });
+      }
+    } else {
+      // Direct invocation: event IS the payload
+      body = event;
     }
 
     const { url, max_depth = 2, max_links = 12 } = body;
 
     // ── Input validation ─────────────────────────────────────────────────────
-    if (!url || typeof url !== 'string') {
-      return response(400, { error: 'url is required (string)' });
-    }
-    if (!URL_REGEX.test(url.trim())) {
-      return response(400, { error: 'url must be a valid http(s) URL' });
-    }
-    if (typeof max_depth !== 'number' || max_depth < 0 || max_depth > MAX_DEPTH_LIMIT) {
-      return response(400, { error: `max_depth must be 0–${MAX_DEPTH_LIMIT}` });
-    }
-    if (typeof max_links !== 'number' || max_links < 1 || max_links > MAX_LINKS_LIMIT) {
-      return response(400, { error: `max_links must be 1–${MAX_LINKS_LIMIT}` });
+    const validationError = (() => {
+      if (!url || typeof url !== 'string')
+        return 'url is required (string)';
+      if (!URL_REGEX.test(url.trim()))
+        return 'url must be a valid http(s) URL';
+      if (typeof max_depth !== 'number' || max_depth < 0 || max_depth > MAX_DEPTH_LIMIT)
+        return `max_depth must be 0–${MAX_DEPTH_LIMIT}`;
+      if (typeof max_links !== 'number' || max_links < 1 || max_links > MAX_LINKS_LIMIT)
+        return `max_links must be 1–${MAX_LINKS_LIMIT}`;
+      return null;
+    })();
+
+    if (validationError) {
+      if (isApiGateway) return response(400, { error: validationError });
+      throw new Error(validationError);
     }
 
     const targetUrl  = url.trim();
@@ -144,17 +162,21 @@ exports.handler = async (event) => {
       target_url: targetUrl,
     }));
 
-    return response(202, {
+    const responseData = {
       session_id:  sessionId,
       status:      'RUNNING',
       target_url:  targetUrl,
       instance_id: instanceId,
       message:     'Crawl started. Poll GET /session/{session_id} to check status.',
-    });
+    };
+
+    // API Gateway expects the proxy envelope; direct callers get plain data.
+    return isApiGateway ? response(202, responseData) : responseData;
 
   } catch (err) {
     console.error(JSON.stringify({ level: 'ERROR', message: err.message, stack: err.stack }));
-    return response(500, { error: 'Internal server error' });
+    if (isApiGateway) return response(500, { error: 'Internal server error' });
+    throw err; // Let Lambda surface it as a FunctionError to the direct caller
   }
 };
 
