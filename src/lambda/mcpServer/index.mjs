@@ -33,7 +33,7 @@
  *   CRAWLER_SG_ID                Egress-only security group ID
  *   CRAWLER_INSTANCE_PROFILE_ARN IAM instance profile ARN for crawlers
  *   CRAWLER_INSTANCE_TYPE        EC2 instance type (default: t3.medium)
- *   LAMBDA_CODE_BUCKET           S3 bucket where crawl.py is stored
+ *   CRAWLER_CODE_BUCKET          Dedicated S3 bucket for crawl.py (key: crawler/crawl.py)
  *   SIGNED_URL_EXPIRES_SECONDS   Pre-signed URL TTL (default: 3600)
  */
 
@@ -58,7 +58,7 @@ const SG_ID                = process.env.CRAWLER_SG_ID;
 const INSTANCE_PROFILE_ARN = process.env.CRAWLER_INSTANCE_PROFILE_ARN;
 const INSTANCE_TYPE        = process.env.CRAWLER_INSTANCE_TYPE || 't3.medium';
 const REGION               = process.env.AWS_REGION            || 'us-east-1';
-const CODE_BUCKET          = process.env.LAMBDA_CODE_BUCKET;
+const CODE_BUCKET          = process.env.CRAWLER_CODE_BUCKET;
 const SIGNED_URL_EXPIRES   = parseInt(process.env.SIGNED_URL_EXPIRES_SECONDS || '3600', 10);
 
 // ── Validation constants ──────────────────────────────────────────────────────
@@ -609,10 +609,10 @@ async function listS3Objects(prefix) {
 // ── EC2 UserData builder ──────────────────────────────────────────────────────
 /**
  * Generates the bash UserData script for a single EC2 crawler run.
- * crawl.py is downloaded from S3 at boot time (uploaded to CODE_BUCKET by deploy.sh).
+ * crawl.py is downloaded from CrawlerCodeBucket at boot time (uploaded by the CI workflow).
+ * Key: crawler/crawl.py
  */
 function buildUserData({ sessionId, targetUrl, region, table, maxDepth, maxLinks }) {
-  // crawl.py lives at: s3://{CODE_BUCKET}/{BUCKET_PREFIX}/crawler/crawl.py
   return `#!/bin/bash
 set -euxo pipefail
 exec > /var/log/screenweave-crawler.log 2>&1
@@ -652,7 +652,7 @@ pip3 install playwright boto3
 python3 -m playwright install chromium
 
 # ── 3. Download crawler script ─────────────────────────────────────────────────
-aws s3 cp "s3://${CODE_BUCKET}/$S3_PREFIX/crawler/crawl.py" /opt/crawl.py --region "$REGION"
+aws s3 cp "s3://${CODE_BUCKET}/crawler/crawl.py" /opt/crawl.py --region "$REGION"
 echo "Crawler: $(wc -l /opt/crawl.py | awk '{print $1}') lines"
 
 # ── 4. Run crawler ─────────────────────────────────────────────────────────────
