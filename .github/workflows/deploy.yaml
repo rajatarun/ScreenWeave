@@ -1,0 +1,119 @@
+name: Deploy ScreenWeave
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/lambda/mcpServer/**'
+      - 'src/crawler/crawl.py'
+      - 'infra/main-stack.yaml'
+      - '.github/workflows/deploy.yaml'
+  workflow_dispatch:
+
+# id-token: write  → request OIDC JWT exchanged for short-lived STS credentials
+# contents: read   → checkout
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  STACK_NAME: screenweave
+  REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No long-lived AWS keys. ASSUME_ROLE_ARN is set in:
+      # Settings → Secrets and variables → Variables
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ASSUME_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+          mask-aws-account-id: true
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/lambda/mcpServer/package.json
+
+      # sam build: runs npm install --production in src/lambda/mcpServer/,
+      # copies built artifacts to .aws-sam/build/, resolves CodeUri paths.
+      - name: SAM build
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Build
+        run: sam build --template-file infra/main-stack.yaml
+
+      # sam deploy --resolve-s3: SAM creates and manages its own deployment
+      # bucket automatically — no bucket parameters needed.
+      # All S3 buckets (ArtifactsBucket, CrawlerCodeBucket) are created by CFN.
+      - name: Deploy
+        run: |
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --region "$REGION" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      # crawl.py is not packaged by SAM (it runs on EC2, not Lambda).
+      # Upload it to the CrawlerCodeBucket created by CloudFormation.
+      - name: Upload crawl.py to CrawlerCodeBucket
+        run: |
+          CRAWLER_BUCKET=$(aws cloudformation describe-stacks \
+            --region "$REGION" \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='CrawlerCodeBucketName'].OutputValue" \
+            --output text)
+
+          aws s3 cp src/crawler/crawl.py \
+            "s3://${CRAWLER_BUCKET}/crawler/crawl.py" \
+            --region "$REGION" --sse AES256
+
+          echo "crawl.py → s3://${CRAWLER_BUCKET}/crawler/crawl.py"
+
+      - name: Smoke-test and print MCP endpoint
+        run: |
+          MCP_ENDPOINT=$(aws cloudformation describe-stacks \
+            --region "$REGION" \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='McpEndpoint'].OutputValue" \
+            --output text)
+
+          HTTP_STATUS=$(curl -s -o /tmp/mcp_resp.json -w "%{http_code}" \
+            -X POST \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+            "$MCP_ENDPOINT")
+
+          cat /tmp/mcp_resp.json
+          [[ "$HTTP_STATUS" == "200" ]] || { echo "Smoke-test failed: HTTP $HTTP_STATUS"; exit 1; }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## ScreenWeave deployed
+
+          | | |
+          |---|---|
+          | **MCP Endpoint** | \`$MCP_ENDPOINT\` |
+          | **Commit** | \`${{ github.sha }}\` |
+          | **Actor** | @${{ github.actor }} |
+
+          \`\`\`json
+          {"mcpServers":{"screenweave":{"url":"$MCP_ENDPOINT"}}}
+          \`\`\`
+          SUMMARY
