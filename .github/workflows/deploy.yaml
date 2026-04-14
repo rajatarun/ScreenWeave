@@ -10,7 +10,7 @@ on:
       - '.github/workflows/deploy.yaml'
   workflow_dispatch:
 
-# id-token: write  → request OIDC JWT, exchanged for short-lived STS creds
+# id-token: write  → request OIDC JWT exchanged for short-lived STS credentials
 # contents: read   → checkout
 permissions:
   id-token: write
@@ -21,11 +21,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REGION: us-east-1
-  BUCKET_PREFIX: screenweave
   STACK_NAME: screenweave
-  FN_NAME: screenweave-mcp
-  ZIP_NAME: mcpServer.zip
+  REGION: us-east-1
 
 jobs:
   deploy:
@@ -35,8 +32,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Assumes the role via OIDC — no long-lived AWS keys in secrets.
-      # Set ASSUME_ROLE_ARN in: Settings → Secrets and variables → Variables
+      # No long-lived AWS keys. ASSUME_ROLE_ARN is set in:
+      # Settings → Secrets and variables → Variables
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -51,51 +48,44 @@ jobs:
           cache: npm
           cache-dependency-path: src/lambda/mcpServer/package.json
 
-      - name: Build mcpServer Lambda
-        run: |
-          cd src/lambda/mcpServer && npm ci --omit=dev --prefer-offline
-          mkdir -p "$GITHUB_WORKSPACE/.build"
-          (cd src/lambda/mcpServer && zip -qr "$GITHUB_WORKSPACE/.build/$ZIP_NAME" . \
-            --exclude "*.test.mjs" --exclude "*.test.js" --exclude "*.md")
-          echo "ZIP: $(du -sh "$GITHUB_WORKSPACE/.build/$ZIP_NAME" | cut -f1)"
+      # sam build: runs npm install --production in src/lambda/mcpServer/,
+      # copies built artifacts to .aws-sam/build/, resolves CodeUri paths.
+      - name: SAM build
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
 
-      - name: Upload Lambda ZIP + crawl.py to S3
-        run: |
-          aws s3 cp ".build/$ZIP_NAME" \
-            "s3://${{ vars.CODE_BUCKET }}/$BUCKET_PREFIX/lambda/$ZIP_NAME" \
-            --region "$REGION" --sse AES256
-          aws s3 cp src/crawler/crawl.py \
-            "s3://${{ vars.CODE_BUCKET }}/$BUCKET_PREFIX/crawler/crawl.py" \
-            --region "$REGION" --sse AES256
+      - name: Build
+        run: sam build --template-file infra/main-stack.yaml
 
-      - name: Deploy CloudFormation stack
+      # sam deploy --resolve-s3: SAM creates and manages its own deployment
+      # bucket automatically — no bucket parameters needed.
+      # All S3 buckets (ArtifactsBucket, CrawlerCodeBucket) are created by CFN.
+      - name: Deploy
         run: |
-          aws cloudformation deploy \
-            --region "$REGION" \
-            --template-file infra/main-stack.yaml \
+          sam deploy \
             --stack-name "$STACK_NAME" \
-            --parameter-overrides \
-              "ArtifactsBucket=${{ vars.ARTIFACTS_BUCKET }}" \
-              "BucketPrefix=$BUCKET_PREFIX" \
-              "LambdaCodeBucket=${{ vars.CODE_BUCKET }}" \
-              "LambdaCodeKey=$BUCKET_PREFIX/lambda/$ZIP_NAME" \
-              "SignedUrlExpiresSeconds=3600" \
-              "Environment=prod" \
+            --region "$REGION" \
+            --resolve-s3 \
             --capabilities CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset \
             --no-fail-on-empty-changeset
 
-      # CFN won't re-deploy Lambda when only the S3 object content changes.
-      # Explicit update-function-code ensures the latest ZIP is always live.
-      - name: Force Lambda code refresh
+      # crawl.py is not packaged by SAM (it runs on EC2, not Lambda).
+      # Upload it to the CrawlerCodeBucket created by CloudFormation.
+      - name: Upload crawl.py to CrawlerCodeBucket
         run: |
-          aws lambda update-function-code \
+          CRAWLER_BUCKET=$(aws cloudformation describe-stacks \
             --region "$REGION" \
-            --function-name "$FN_NAME" \
-            --s3-bucket "${{ vars.CODE_BUCKET }}" \
-            --s3-key "$BUCKET_PREFIX/lambda/$ZIP_NAME" \
-            --query "FunctionArn" --output text
-          aws lambda wait function-updated \
-            --region "$REGION" --function-name "$FN_NAME"
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='CrawlerCodeBucketName'].OutputValue" \
+            --output text)
+
+          aws s3 cp src/crawler/crawl.py \
+            "s3://${CRAWLER_BUCKET}/crawler/crawl.py" \
+            --region "$REGION" --sse AES256
+
+          echo "crawl.py → s3://${CRAWLER_BUCKET}/crawler/crawl.py"
 
       - name: Smoke-test and print MCP endpoint
         run: |
