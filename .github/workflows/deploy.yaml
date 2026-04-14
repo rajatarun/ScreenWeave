@@ -1,0 +1,227 @@
+name: Deploy ScreenWeave
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main          # → prod
+      - staging       # → staging
+      - develop       # → dev
+    paths:
+      - 'src/lambda/mcpServer/**'
+      - 'src/crawler/crawl.py'
+      - 'infra/main-stack.yaml'
+      - '.github/workflows/deploy.yaml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [prod, staging, dev]
+        default: prod
+      skip_build:
+        description: Skip npm install + zip (re-use cached artifact)
+        type: boolean
+        default: false
+
+# ── Permissions (OIDC) ────────────────────────────────────────────────────────
+# id-token: write  → allows the job to request an OIDC JWT from GitHub,
+#                    which aws-actions/configure-aws-credentials exchanges
+#                    for short-lived STS credentials via AssumeRoleWithWebIdentity.
+# contents: read   → allows checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# Prevent concurrent deploys to the same environment; queue rather than cancel.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# ── Shared env ────────────────────────────────────────────────────────────────
+env:
+  REGION: us-east-1
+  BUCKET_PREFIX: screenweave
+  ZIP_NAME: mcpServer.zip
+
+jobs:
+  deploy:
+    name: Deploy (${{ github.event.inputs.environment || (github.ref_name == 'main' && 'prod') || (github.ref_name == 'staging' && 'staging') || 'dev' }})
+    runs-on: ubuntu-latest
+
+    # ── Resolve environment name ───────────────────────────────────────────────
+    # workflow_dispatch: use the selected input.
+    # push: derive from branch name (main→prod, staging→staging, *→dev).
+    env:
+      DEPLOY_ENV: >-
+        ${{
+          github.event_name == 'workflow_dispatch' && inputs.environment ||
+          github.ref_name == 'main'    && 'prod'    ||
+          github.ref_name == 'staging' && 'staging' ||
+          'dev'
+        }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Configure AWS credentials via OIDC ────────────────────────────────
+      # No long-lived access keys stored in secrets.
+      # ASSUME_ROLE_ARN must be set as a GitHub Actions repository variable:
+      #   Settings → Secrets and variables → Variables →
+      #   ASSUME_ROLE_ARN = arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ASSUME_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+          # Mask the assumed role ARN in logs
+          mask-aws-account-id: true
+
+      # ── 3. Node.js setup ─────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/lambda/mcpServer/package.json
+
+      # ── 4. Build Lambda ZIP ───────────────────────────────────────────────────
+      - name: Build mcpServer Lambda
+        if: ${{ !inputs.skip_build }}
+        run: |
+          cd src/lambda/mcpServer
+          npm ci --omit=dev --prefer-offline
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p .build
+          (cd src/lambda/mcpServer && zip -qr "$GITHUB_WORKSPACE/.build/$ZIP_NAME" . \
+            --exclude "*.test.mjs" \
+            --exclude "*.test.js" \
+            --exclude "*.md")
+          echo "ZIP size: $(du -sh .build/$ZIP_NAME | cut -f1)"
+
+      # Upload the artifact so it can be re-used with skip_build on re-runs
+      - name: Cache Lambda ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpServer-zip-${{ github.sha }}
+          path: .build/${{ env.ZIP_NAME }}
+          retention-days: 3
+
+      # ── 5. Upload to S3 ───────────────────────────────────────────────────────
+      # CODE_BUCKET must be set as a GitHub Actions repository variable:
+      #   Settings → Secrets and variables → Variables → CODE_BUCKET = <bucket-name>
+      - name: Upload Lambda ZIP + crawl.py to S3
+        run: |
+          LAMBDA_KEY="${BUCKET_PREFIX}/lambda/${ZIP_NAME}"
+          CRAWLER_KEY="${BUCKET_PREFIX}/crawler/crawl.py"
+
+          aws s3 cp ".build/${ZIP_NAME}" \
+            "s3://${{ vars.CODE_BUCKET }}/${LAMBDA_KEY}" \
+            --region "${REGION}" --sse AES256
+          echo "Uploaded: s3://${{ vars.CODE_BUCKET }}/${LAMBDA_KEY}"
+
+          aws s3 cp src/crawler/crawl.py \
+            "s3://${{ vars.CODE_BUCKET }}/${CRAWLER_KEY}" \
+            --region "${REGION}" --sse AES256
+          echo "Uploaded: s3://${{ vars.CODE_BUCKET }}/${CRAWLER_KEY}"
+
+      # ── 6. Deploy CloudFormation stack ────────────────────────────────────────
+      # ARTIFACTS_BUCKET must be set as a GitHub Actions repository variable:
+      #   Settings → Secrets and variables → Variables → ARTIFACTS_BUCKET = <bucket-name>
+      - name: Deploy CloudFormation stack
+        run: |
+          STACK_NAME="screenweave-${DEPLOY_ENV}"
+          LAMBDA_KEY="${BUCKET_PREFIX}/lambda/${ZIP_NAME}"
+
+          aws cloudformation deploy \
+            --region "${REGION}" \
+            --template-file infra/main-stack.yaml \
+            --stack-name "${STACK_NAME}" \
+            --parameter-overrides \
+              "ArtifactsBucket=${{ vars.ARTIFACTS_BUCKET }}" \
+              "BucketPrefix=${BUCKET_PREFIX}" \
+              "LambdaCodeBucket=${{ vars.CODE_BUCKET }}" \
+              "LambdaCodeKey=${LAMBDA_KEY}" \
+              "SignedUrlExpiresSeconds=3600" \
+              "Environment=${DEPLOY_ENV}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+          echo "Stack deployed: ${STACK_NAME}"
+
+      # ── 7. Force Lambda code refresh ─────────────────────────────────────────
+      # CloudFormation won't re-deploy Lambda when only the S3 object content
+      # changes (same key). update-function-code guarantees the live function
+      # always runs the code from this commit.
+      - name: Force Lambda code refresh
+        run: |
+          FN_NAME="screenweave-mcp-${DEPLOY_ENV}"
+          LAMBDA_KEY="${BUCKET_PREFIX}/lambda/${ZIP_NAME}"
+
+          aws lambda update-function-code \
+            --region "${REGION}" \
+            --function-name "${FN_NAME}" \
+            --s3-bucket "${{ vars.CODE_BUCKET }}" \
+            --s3-key "${LAMBDA_KEY}" \
+            --query "FunctionArn" --output text
+
+          aws lambda wait function-updated \
+            --region "${REGION}" \
+            --function-name "${FN_NAME}"
+          echo "Lambda refreshed: ${FN_NAME}"
+
+      # ── 8. Smoke-test + print MCP endpoint ───────────────────────────────────
+      - name: Smoke-test and print MCP endpoint
+        run: |
+          STACK_NAME="screenweave-${DEPLOY_ENV}"
+
+          MCP_ENDPOINT=$(aws cloudformation describe-stacks \
+            --region "${REGION}" \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='McpEndpoint'].OutputValue" \
+            --output text)
+
+          # Verify the endpoint responds to tools/list
+          HTTP_STATUS=$(curl -s -o /tmp/mcp_response.json -w "%{http_code}" \
+            -X POST \
+            -H 'content-type: application/json' \
+            -H 'accept: text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+            "${MCP_ENDPOINT}")
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          echo "Response:"
+          cat /tmp/mcp_response.json
+
+          if [[ "${HTTP_STATUS}" != "200" ]]; then
+            echo "ERROR: MCP endpoint returned HTTP ${HTTP_STATUS}" >&2
+            exit 1
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  MCP Endpoint: ${MCP_ENDPOINT}"
+          echo ""
+          echo "  MCP client config:"
+          echo '  {"mcpServers":{"screenweave":{"url":"'"${MCP_ENDPOINT}"'"}}}'
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Expose endpoint as a job output via GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## ScreenWeave Deploy — ${DEPLOY_ENV}
+
+          | | |
+          |---|---|
+          | **Environment** | \`${DEPLOY_ENV}\` |
+          | **MCP Endpoint** | \`${MCP_ENDPOINT}\` |
+          | **Commit** | \`${{ github.sha }}\` |
+          | **Deployed by** | @${{ github.actor }} |
+
+          ### MCP client config
+          \`\`\`json
+          {"mcpServers":{"screenweave":{"url":"${MCP_ENDPOINT}"}}}
+          \`\`\`
+          SUMMARY
