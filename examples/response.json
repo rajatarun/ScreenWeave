@@ -1,0 +1,60 @@
+{
+  "_comment": "Example response from GET /session/sess-abc123?include=screenshots,states,transitions,trace",
+
+  "session_id": "sess-abc123",
+  "status": "COMPLETED",
+
+  "artifacts": {
+    "screenshots": [
+      {
+        "state_id": "state_1",
+        "s3_url": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_1.png",
+        "https_url": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/screenshots/state_1.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=abc123def456..."
+      },
+      {
+        "state_id": "state_2",
+        "s3_url": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_2.png",
+        "https_url": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/screenshots/state_2.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=def456ghi789..."
+      },
+      {
+        "state_id": "state_3",
+        "s3_url": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_3.png",
+        "https_url": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/screenshots/state_3.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=ghi789jkl012..."
+      }
+    ],
+    "states_json": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/states.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=mno345pqr678...",
+    "transitions_json": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/transitions.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=stu901vwx234...",
+    "trace_file": "https://my-artifacts-bucket.s3.us-east-1.amazonaws.com/screenweave/sess-abc123/trace.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240315%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240315T103000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=yza567bcd890..."
+  },
+
+  "indexed_states": [
+    {
+      "state_id": "state_1",
+      "url": "https://example.com/",
+      "timestamp": "2024-03-15T10:30:00.000Z",
+      "s3_screenshot": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_1.png"
+    },
+    {
+      "state_id": "state_2",
+      "url": "https://example.com/products",
+      "timestamp": "2024-03-15T10:30:15.432Z",
+      "s3_screenshot": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_2.png"
+    },
+    {
+      "state_id": "state_3",
+      "url": "https://example.com/products/widget-pro",
+      "timestamp": "2024-03-15T10:30:42.891Z",
+      "s3_screenshot": "s3://my-artifacts-bucket/screenweave/sess-abc123/screenshots/state_3.png"
+    }
+  ],
+
+  "metadata": {
+    "created_at": "2024-03-15T10:29:55.000Z",
+    "updated_at": "2024-03-15T10:31:20.000Z",
+    "summary_stats": {
+      "total_states": 3,
+      "total_screenshots": 3,
+      "duration_seconds": 85
+    }
+  }
+}
