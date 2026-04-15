@@ -49,9 +49,10 @@ KEEP_FIELDS = frozenset(
 
 MAX_IMG_BYTES = 5 * 1024 * 1024  # 5 MB — skip larger screenshots with a warning
 
-# Bedrock rejects any image dimension > 2000 px in multi-image requests.
-# Resize to this max on the longer edge, preserving aspect ratio.
+# Target short edge (drives scale for normal screenshots).
 MAX_IMG_DIMENSION = 512
+# Hard cap on the long edge — Bedrock rejects > 2000 px in multi-image requests.
+MAX_LONG_EDGE = 1568
 
 # Bedrock ThrottlingException backoff schedule (seconds)
 _BACKOFF = (2, 4, 8)
@@ -163,15 +164,25 @@ def _make_batches(
 
 def _resize_image(data: bytes) -> bytes:
     """
-    Resize image so the shortest edge equals MAX_IMG_DIMENSION pixels,
-    preserving aspect ratio. No-op if the shortest edge is already within limit.
+    Resize image preserving aspect ratio using two constraints:
+      1. Short edge → MAX_IMG_DIMENSION (512 px) for normal screenshots
+      2. Long edge  → MAX_LONG_EDGE (1568 px) hard cap for tall full-page captures
+
+    Takes the more restrictive scale so neither limit is exceeded.
+    No-op if the image already satisfies both constraints.
+
+    Examples:
+      1280x720   → scale=0.71 (short-edge drives) → 910x512
+      1280x16937 → scale=0.09 (long-edge drives)  → 118x1568
     """
     img = Image.open(io.BytesIO(data))
     w, h = img.size
-    short_edge = min(w, h)
-    if short_edge <= MAX_IMG_DIMENSION:
+    scale = min(
+        MAX_IMG_DIMENSION / min(w, h),  # short-edge target
+        MAX_LONG_EDGE / max(w, h),      # long-edge hard cap
+    )
+    if scale >= 1.0:
         return data
-    scale = MAX_IMG_DIMENSION / short_edge
     new_size = (int(w * scale), int(h * scale))
     logger.info("Resizing screenshot %dx%d → %dx%d", w, h, new_size[0], new_size[1])
     img = img.resize(new_size, Image.LANCZOS)
