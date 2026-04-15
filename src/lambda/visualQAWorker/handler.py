@@ -568,6 +568,9 @@ def handler(event: dict, context) -> None:
     The function always writes either the QA report or an error report to S3
     so the caller can always poll for a result.
     """
+    # Log immediately — before any other work — so we know the handler was reached.
+    logger.info("VisualQA-Worker handler invoked | event_keys=%s", list(event.keys()))
+
     session_id: str = event.get("session_id", "")
     bucket: str = event.get("bucket") or os.environ.get("ARTIFACTS_BUCKET", "")
     prefix: str = event.get("prefix") or os.environ.get("BUCKET_PREFIX", "screenweave")
@@ -576,11 +579,12 @@ def handler(event: dict, context) -> None:
     report_key = f"{prefix}/{session_id}/qa_report.json"
 
     logger.info(
-        "VisualQA-Worker started | session=%s parent=%s bucket=%s prefix=%s",
+        "VisualQA-Worker started | session=%s parent=%s bucket=%s prefix=%s report_key=%s",
         session_id,
         parent_session_id or "none",
         bucket,
         prefix,
+        report_key,
     )
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -589,12 +593,20 @@ def handler(event: dict, context) -> None:
         # 0. Fetch and summarise parent session report (optional, best-effort)
         parent_summary: str | None = None
         if parent_session_id:
+            logger.info("Step 0 | fetching parent context for session=%s", parent_session_id)
             parent_summary = _fetch_parent_summary(bucket, prefix, parent_session_id)
+            logger.info(
+                "Step 0 | parent context %s",
+                f"ready ({len(parent_summary)} chars)" if parent_summary else "skipped",
+            )
 
         # 1. Discover + pre-process
+        logger.info("Step 1 | discovering states from s3://%s/%s/%s/states.json", bucket, prefix, session_id)
         stripped_states, _screenshot_keys = _discover_states(bucket, prefix, session_id)
+        logger.info("Step 1 | found %d states, %d screenshot keys", len(stripped_states), len(_screenshot_keys))
 
         if not stripped_states:
+            logger.error("Step 1 | no states found — writing error report")
             _write_report(
                 bucket,
                 report_key,
@@ -609,19 +621,32 @@ def handler(event: dict, context) -> None:
             return
 
         # 2. Pair each state with its expected screenshot key
+        logger.info("Step 2 | pairing states to screenshot keys")
         pairs = _pair_screenshots(stripped_states, bucket, prefix, session_id)
+        missing = sum(1 for _, k in pairs if k is None)
+        logger.info("Step 2 | %d pairs (%d missing screenshots)", len(pairs), missing)
 
         # 3. Batch
         batches = _make_batches(pairs, BATCH_SIZE)
         logger.info(
-            "%d states → %d batches of up to %d",
+            "Step 3 | %d states → %d batches of up to %d",
             len(pairs),
             len(batches),
             BATCH_SIZE,
         )
 
         # 4. Run multi-turn Visual QA (parent_summary may be None — that's fine)
+        logger.info(
+            "Step 4 | starting multi-turn Bedrock QA | batches=%d parent_context=%s",
+            len(batches),
+            "yes" if parent_summary else "no",
+        )
         report = _run_visual_qa(batches, bucket, parent_summary=parent_summary)
+        logger.info(
+            "Step 4 | QA complete | overall_status=%s issues=%d",
+            report.get("overall_status", "UNKNOWN"),
+            len(report.get("all_issues", [])),
+        )
 
         # Stamp metadata onto the report
         report["session_id"] = session_id
@@ -632,10 +657,12 @@ def handler(event: dict, context) -> None:
             report["parent_context_used"] = parent_summary is not None
 
         # 5. Write report to S3
+        logger.info("Step 5 | writing report to s3://%s/%s", bucket, report_key)
         _write_report(bucket, report_key, report)
+        logger.info("VisualQA-Worker finished successfully | session=%s", session_id)
 
     except FileNotFoundError as exc:
-        logger.error("Artifact missing: %s", exc)
+        logger.error("Artifact missing: %s", exc, exc_info=True)
         _write_report(
             bucket,
             report_key,
