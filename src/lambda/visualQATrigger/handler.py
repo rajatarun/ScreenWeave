@@ -121,10 +121,12 @@ def handler(event: dict, context) -> dict:
         parent_session_id or "none",
     )
 
+    html_s3_key = report_s3_key.replace(".json", ".html")
     response_body: dict = {
         "job_id": session_id,
         "status": "RUNNING",
         "report_s3_key": report_s3_key,
+        "html_report_s3_key": html_s3_key,
         "message": f"QA job started. Poll s3://{bucket}/{report_s3_key} for results.",
     }
     if parent_session_id:
