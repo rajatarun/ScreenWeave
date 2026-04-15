@@ -4,6 +4,9 @@ ScreenWeave Visual QA — Worker Lambda
 Invoked asynchronously by the Trigger Lambda.
 
 Flow:
+  0. Parent context      → if parent_session_id supplied, fetch its qa_report.json,
+                           summarise it with Claude, inject summary as prior context
+                           (silently skipped if the report is absent or on any error)
   1. Discover artifacts  → list S3 keys under {prefix}/{session_id}/
   2. Pre-process         → fetch states.json, strip to minimal fields
   3. Pair screenshots    → match each state to its S3 screenshot key
@@ -178,6 +181,88 @@ def _download_b64(bucket: str, key: str) -> str | None:
         raise
 
 
+# ── Parent session context ────────────────────────────────────────────────────
+
+
+def _fetch_parent_summary(bucket: str, prefix: str, parent_session_id: str) -> str | None:
+    """
+    Fetch the QA report for parent_session_id, summarise it with Claude,
+    and return a concise summary string for use as prior context.
+
+    Returns None — and logs a warning — if:
+      • The report key does not exist in S3
+      • Any S3 or Bedrock error occurs
+    Callers should proceed normally (BAU) on None.
+    """
+    report_key = f"{prefix}/{parent_session_id}/qa_report.json"
+    logger.info("Fetching parent session report: s3://%s/%s", bucket, report_key)
+
+    # 1. Fetch the parent report from S3
+    try:
+        obj = _s3.get_object(Bucket=bucket, Key=report_key)
+        report_text = obj["Body"].read().decode("utf-8")
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code in ("NoSuchKey", "404"):
+            logger.info(
+                "Parent report not found for session %s — skipping context injection",
+                parent_session_id,
+            )
+        else:
+            logger.warning(
+                "Could not fetch parent report %s (%s) — skipping context injection",
+                report_key,
+                exc,
+            )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Unexpected error fetching parent report: %s — skipping context injection", exc
+        )
+        return None
+
+    # Guard: empty or non-JSON report (e.g. a previous error stub)
+    try:
+        json.loads(report_text)
+    except json.JSONDecodeError:
+        logger.warning("Parent report is not valid JSON — skipping context injection")
+        return None
+
+    # 2. Summarise with Claude (single-turn, no images needed)
+    logger.info("Summarising parent report with Claude (%d chars)", len(report_text))
+    try:
+        summary = _invoke_bedrock(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Summarise the following Visual QA report concisely. "
+                                "Focus on overall status, the most significant issues found, "
+                                "and any cross-batch observations. "
+                                "Keep the summary under 300 words.\n\n"
+                                f"REPORT:\n{report_text}"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        )
+        logger.info(
+            "Parent context summary ready (%d chars) for session %s",
+            len(summary),
+            parent_session_id,
+        )
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not summarise parent report: %s — skipping context injection", exc
+        )
+        return None
+
+
 # ── Bedrock prompt builders ───────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
@@ -341,15 +426,49 @@ def _invoke_bedrock(messages: list[dict]) -> str:
 def _run_visual_qa(
     batches: list[list[tuple[dict, str | None]]],
     bucket: str,
+    parent_summary: str | None = None,
 ) -> dict:
     """
     Drive the multi-turn Bedrock conversation across all batches.
+
+    If parent_summary is provided it is injected as the first [user, assistant]
+    exchange so Claude has prior-session context before seeing any screenshots.
 
     Returns the parsed QA report dict from Claude's final consolidation turn.
     """
     messages: list[dict] = []
     total_batches = len(batches)
     total_states = sum(len(b) for b in batches)
+
+    # ── Inject parent context ─────────────────────────────────────────────────
+    if parent_summary:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Before we begin, here is a summary of a prior related QA session. "
+                            "Keep these findings in mind — they may help you spot regressions "
+                            "or confirm improvements in the current session.\n\n"
+                            f"PRIOR SESSION SUMMARY:\n{parent_summary}"
+                        ),
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    "Understood. I've noted the prior session findings and will use them "
+                    "as reference context when reviewing the current session — particularly "
+                    "for regression detection and cross-session consistency."
+                ),
+            }
+        )
+        logger.info("Parent context injected into conversation (%d chars)", len(parent_summary))
 
     for batch_idx, batch in enumerate(batches):
         logger.info(
@@ -434,10 +553,17 @@ def handler(event: dict, context) -> None:
 
     Expected event shape:
       {
-        "session_id": str,
-        "bucket":     str,
-        "prefix":     str   (default: "screenweave")
+        "session_id":        str,
+        "bucket":            str,
+        "prefix":            str,            (default: "screenweave")
+        "parent_session_id": str | absent    (optional)
       }
+
+    If parent_session_id is present, the Worker fetches that session's
+    qa_report.json, summarises it with Claude, and uses the summary as
+    prior context before starting the current session analysis. If the
+    report is not found in S3 — or any error occurs — the step is silently
+    skipped and analysis proceeds normally.
 
     The function always writes either the QA report or an error report to S3
     so the caller can always poll for a result.
@@ -445,12 +571,14 @@ def handler(event: dict, context) -> None:
     session_id: str = event.get("session_id", "")
     bucket: str = event.get("bucket") or os.environ.get("ARTIFACTS_BUCKET", "")
     prefix: str = event.get("prefix") or os.environ.get("BUCKET_PREFIX", "screenweave")
+    parent_session_id: str | None = event.get("parent_session_id") or None
 
     report_key = f"{prefix}/{session_id}/qa_report.json"
 
     logger.info(
-        "VisualQA-Worker started | session=%s bucket=%s prefix=%s",
+        "VisualQA-Worker started | session=%s parent=%s bucket=%s prefix=%s",
         session_id,
+        parent_session_id or "none",
         bucket,
         prefix,
     )
@@ -458,6 +586,11 @@ def handler(event: dict, context) -> None:
     started_at = datetime.now(timezone.utc).isoformat()
 
     try:
+        # 0. Fetch and summarise parent session report (optional, best-effort)
+        parent_summary: str | None = None
+        if parent_session_id:
+            parent_summary = _fetch_parent_summary(bucket, prefix, parent_session_id)
+
         # 1. Discover + pre-process
         stripped_states, _screenshot_keys = _discover_states(bucket, prefix, session_id)
 
@@ -487,13 +620,16 @@ def handler(event: dict, context) -> None:
             BATCH_SIZE,
         )
 
-        # 4. Run multi-turn Visual QA
-        report = _run_visual_qa(batches, bucket)
+        # 4. Run multi-turn Visual QA (parent_summary may be None — that's fine)
+        report = _run_visual_qa(batches, bucket, parent_summary=parent_summary)
 
         # Stamp metadata onto the report
         report["session_id"] = session_id
         report["generated_at"] = datetime.now(timezone.utc).isoformat()
         report["started_at"] = started_at
+        if parent_session_id:
+            report["parent_session_id"] = parent_session_id
+            report["parent_context_used"] = parent_summary is not None
 
         # 5. Write report to S3
         _write_report(bucket, report_key, report)
