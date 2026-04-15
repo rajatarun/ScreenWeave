@@ -260,9 +260,9 @@ Resources:
                 Action: bedrock:InvokeModel
                 Resource:
                   # Foundation model ARN (required even when invoking via inference profile)
-                  - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0'
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0'
                   # Cross-region inference profile ARN (us.* prefix routes across US regions)
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0'
 
   CrawlerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
