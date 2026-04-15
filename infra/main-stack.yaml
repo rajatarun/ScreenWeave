@@ -363,7 +363,7 @@ Resources:
   VisualQAWorkerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /aws/lambda/VisualQA-Worker
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-visualqa-worker'
       RetentionInDays: 30
 
   VisualQAWorkerFunction:
