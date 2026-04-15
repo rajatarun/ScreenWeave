@@ -1,134 +1,248 @@
 # ScreenWeave
 
-ScreenWeave provisions a short-lived AWS EC2 worker that:
+ScreenWeave is an AWS-native website crawling and visual QA platform. It uses Playwright to walk a site, capture every visual state (including interactive UI transitions), and persist structured artifacts to S3. A separate Visual QA pipeline feeds those artifacts through Claude 3.5 Sonnet via Amazon Bedrock to produce a structured report of anomalies, regressions, and cross-page inconsistencies.
 
-1. Crawls a target website with Playwright + Chromium.
-2. Captures full-page screenshots (including interactive/tabbed UI states).
-3. Builds a stitched MP4 using `ffmpeg`.
-4. Uploads artifacts to S3.
-5. Self-terminates when finished.
+Two independent entry points are exposed:
 
-The infrastructure is defined in CloudFormation (`template.yaml`) and deployed with a helper script (`deploy.sh`).
+| Entry point | Protocol | Purpose |
+|---|---|---|
+| `POST /mcp` | MCP JSON-RPC 2.0 over HTTP | Trigger crawls, poll status, retrieve screenshots and metrics from any MCP-compatible client |
+| `POST /visual-qa` | REST | Start an asynchronous Visual QA job against a completed crawl session |
 
-## What gets created
-
-Deploying this project creates:
-
-- **IAM Role** for EC2 with:
-  - `AmazonSSMManagedInstanceCore` for Session Manager access.
-  - Inline policy permissions for:
-    - `s3:PutObject` to `s3://<bucket>/<prefix>/*`
-    - `ec2:TerminateInstances` (self-termination)
-- **IAM Instance Profile** attached to EC2.
-- **Security Group** (egress only).
-- **EC2 Instance** that runs all crawl/render/upload logic in `UserData`.
-
-## Artifacts produced
-
-By default, artifacts are uploaded under:
-
-- `s3://<bucket>/website-videos/tarunraja_product_video.mp4`
-- `s3://<bucket>/website-videos/screens.zip`
-- `s3://<bucket>/website-videos/video-gen.log`
-
-You can override the S3 prefix at deploy time.
-
-## Prerequisites
-
-- AWS CLI configured with credentials and permission to:
-  - deploy CloudFormation stacks
-  - create/attach IAM roles and instance profiles
-  - launch EC2 instances
-  - write to your S3 bucket
-- An existing S3 bucket for outputs.
-- Access to AWS Systems Manager Session Manager (optional, for live log viewing).
+---
 
 ## Quick start
 
-```bash
-chmod +x deploy.sh
-./deploy.sh <s3-bucket> [region] [target-url] [s3-prefix]
-```
-
-Examples:
+### 1. Deploy
 
 ```bash
-# Use defaults for region, target, and prefix
-./deploy.sh my-output-bucket
-
-# Override everything
-./deploy.sh my-output-bucket us-east-1 https://example.com demo-runs
+git clone https://github.com/rajatarun/ScreenWeave
+cd ScreenWeave
+sam build --template-file infra/main-stack.yaml
+sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM
 ```
 
-## Script arguments (`deploy.sh`)
+After deploy, note the two stack outputs:
 
-- `s3-bucket` (**required**) – destination bucket.
-- `region` (default: `us-east-1`) – AWS region.
-- `target-url` (default: `https://tarunraja.info`) – crawl root URL.
-- `s3-prefix` (default: `website-videos`) – output folder prefix.
+```
+McpEndpoint      → https://<id>.execute-api.<region>.amazonaws.com/mcp
+VisualQAEndpoint → https://<id>.execute-api.<region>.amazonaws.com/v1/visual-qa
+```
 
-The stack name is hardcoded to:
+### 2. Connect an MCP client
 
-- `tarunraja-video-gen`
+Paste the `McpClientConfig` stack output directly into your MCP client configuration:
 
-## Runtime behavior
+```json
+{
+  "mcpServers": {
+    "screenweave": {
+      "url": "https://<McpHttpApi>.execute-api.<region>.amazonaws.com/mcp"
+    }
+  }
+}
+```
 
-Inside EC2 `UserData`, the worker does the following:
+No AWS credentials are required on the client side.
 
-1. Installs dependencies (`python3-pip`, ImageMagick, static ffmpeg, Chromium deps).
-2. Installs Playwright and Chromium.
-3. Writes and runs a Python crawler script.
-4. Captures screenshots with a 1280x800 viewport.
-5. Generates intro/outro title cards with ImageMagick.
-6. Builds an MP4 via ffmpeg concat + scale/pad pipeline.
-7. Uploads video/screens/log to S3.
-8. Calls EC2 terminate on itself.
+### 3. Upload the crawler script
 
-Crawler defaults in the embedded script:
-
-- Max crawl depth: **2**
-- Max internal links per page: **12**
-
-## Monitoring progress
-
-After deploy, the script prints commands to monitor execution.
-
-### Attach via Session Manager
+`crawl.py` runs on EC2, not Lambda. Upload it after the first deploy:
 
 ```bash
-aws ssm start-session --target <instance-id> --region <region>
-sudo tail -f /var/log/video-gen.log
+CRAWLER_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name screenweave \
+  --query "Stacks[0].Outputs[?OutputKey=='CrawlerCodeBucketName'].OutputValue" \
+  --output text)
+
+aws s3 cp src/crawler/crawl.py s3://${CRAWLER_BUCKET}/crawler/crawl.py --sse AES256
 ```
 
-### Poll S3 uploads
+This step is automated in CI (`.github/workflows/deploy.yaml`).
+
+---
+
+## MCP tools
+
+All tools are invoked via `POST /mcp` using standard MCP JSON-RPC 2.0.
+
+### `crawl_url`
+
+Launch a crawl session against a target URL. Returns a `session_id` immediately while an EC2 worker runs in the background.
+
+```json
+{ "url": "https://example.com", "max_depth": 2, "max_links": 12 }
+```
+
+### `get_session_status`
+
+Poll the status of a crawl session (`RUNNING`, `COMPLETED`, or `FAILED`).
+
+```json
+{ "session_id": "sess-abc123" }
+```
+
+### `get_screenshots`
+
+Retrieve pre-signed S3 URLs for all screenshots captured in a session.
+
+```json
+{ "session_id": "sess-abc123" }
+```
+
+### `get_metrics`
+
+Return computed crawl metrics: total states, unique URLs, transition graph summary, duration.
+
+```json
+{ "session_id": "sess-abc123" }
+```
+
+### `get_full_session`
+
+Return all artifacts for a session in one call: screenshots, `states.json`, `transitions.json`, `trace.zip`.
+
+```json
+{ "session_id": "sess-abc123" }
+```
+
+---
+
+## Visual QA
+
+The Visual QA pipeline analyses a completed crawl session with Claude 3.5 Sonnet via Bedrock. Screenshots are processed in batches of 10; Claude maintains shared conversation context across all batches so it can detect cross-page regressions and inconsistencies.
+
+### Start a QA job
 
 ```bash
-watch -n 15 "aws s3 ls s3://<bucket>/<prefix>/"
+curl -X POST https://<VisualQAEndpoint> \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "sess-abc123"}'
 ```
 
-## Cleanup
+Response (`202 Accepted`):
 
-Delete the stack when done:
+```json
+{
+  "job_id": "sess-abc123",
+  "status": "RUNNING",
+  "report_s3_key": "screenweave/sess-abc123/qa_report.json",
+  "message": "QA job started. Poll the report key for results."
+}
+```
+
+### Use prior session context
+
+Pass `parent_session_id` to inject a summary of a previous session's QA report as context before the current analysis begins. Useful for regression detection across deploys.
 
 ```bash
-aws cloudformation delete-stack --stack-name tarunraja-video-gen --region <region>
+curl -X POST https://<VisualQAEndpoint> \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "sess-new",
+    "parent_session_id": "sess-previous"
+  }'
 ```
 
-## CloudFormation parameters
+If the parent report is not found in S3, the step is silently skipped and analysis proceeds normally.
 
-`template.yaml` supports:
+### Fetch the report
 
-- `S3Bucket` (required)
-- `S3Prefix` (default: `website-videos`)
-- `TargetURL` (default: `https://tarunraja.info`)
-- `InstanceType` (default: `t3.medium`, allowed: `t3.small|t3.medium|t3.large`)
-- `AmiId` (default: latest Amazon Linux 2023 via SSM Parameter)
+The report is written to S3 when the job completes:
 
-## Notes and limitations
+```bash
+aws s3 cp s3://<ArtifactsBucket>/screenweave/<session_id>/qa_report.json .
+```
 
-- The generated MP4 output filename is currently fixed as `tarunraja_product_video.mp4`.
-- The intro/outro card text is currently tailored to `tarunraja.info` branding in the embedded crawler.
-- The security group has no inbound rules; debugging is expected through SSM.
+Report shape:
+
+```json
+{
+  "report_version": "1.0",
+  "overall_status": "PASS",
+  "session_id": "sess-abc123",
+  "total_states_analyzed": 24,
+  "total_batches": 3,
+  "findings": [
+    {
+      "state_id": "state_0001",
+      "url": "https://example.com/",
+      "passed": true,
+      "observations": "...",
+      "issues": []
+    }
+  ],
+  "cross_batch_observations": "...",
+  "all_issues": [],
+  "generated_at": "2026-04-15T10:30:00Z"
+}
+```
+
+---
+
+## S3 artifact layout
+
+```
+s3://<ArtifactsBucket>/
+└── screenweave/
+    └── <session_id>/
+        ├── states.json          # Structured metadata for every crawled state
+        ├── transitions.json     # Directed graph of page transitions
+        ├── trace.zip            # Playwright trace (open with: playwright show-trace)
+        ├── screenshots/
+        │   ├── state_0001.png
+        │   ├── state_0002.png
+        │   └── ...
+        └── qa_report.json       # Written by Visual QA Worker on completion
+```
+
+---
+
+## CI/CD
+
+Pushes to `main` that touch `src/`, `infra/main-stack.yaml`, or the workflow file trigger an automatic deploy via GitHub Actions (`.github/workflows/deploy.yaml`).
+
+The workflow:
+1. Authenticates to AWS using OIDC (no long-lived keys — set `ASSUME_ROLE_ARN` in repository variables)
+2. Runs `sam build && sam deploy`
+3. Uploads `crawl.py` to `CrawlerCodeBucket`
+4. Smoke-tests the MCP endpoint and prints the URL to the job summary
+
+---
+
+## Repository layout
+
+```
+infra/
+  main-stack.yaml          SAM/CloudFormation template — all infrastructure
+src/
+  crawler/
+    crawl.py               Playwright crawler (runs on EC2)
+  lambda/
+    mcpServer/
+      index.mjs            MCP JSON-RPC server (Node.js 20, HTTP API)
+    visualQATrigger/
+      handler.py           REST API entry-point — validates & fires Worker (Python 3.12)
+    visualQAWorker/
+      handler.py           Async Bedrock orchestrator — multi-turn Claude QA (Python 3.12)
+.github/
+  workflows/
+    deploy.yaml            CI/CD pipeline
+examples/
+  response.json            Example get_full_session response
+docs/
+  architecture.md          Detailed architecture reference
+```
+
+---
+
+## Prerequisites
+
+- AWS CLI configured with permissions to deploy CloudFormation, create IAM roles, and launch EC2
+- AWS SAM CLI (`brew install aws-sam-cli` or see the [installation guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
+- Amazon Bedrock model access enabled for `anthropic.claude-3-5-sonnet-20241022-v2:0` in your region
+
+---
 
 ## License
 
