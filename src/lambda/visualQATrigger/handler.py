@@ -107,52 +107,18 @@ def handler(event: dict, context) -> dict:
     if parent_session_id:
         worker_payload["parent_session_id"] = parent_session_id
 
-    logger.info(
-        "Invoking worker | function=%s session_id=%s parent_session_id=%s payload_keys=%s",
-        worker_fn,
-        session_id,
-        parent_session_id or "none",
-        list(worker_payload.keys()),
-    )
-
-    # InvocationType=Event → async fire-and-forget; Lambda service returns 202
-    # immediately if the invocation was accepted. A non-202 status or a
-    # FunctionError field means the invocation was rejected before execution.
-    invoke_resp = _lambda.invoke(
+    # InvocationType=Event → async fire-and-forget; API Gateway returns 202 immediately.
+    # The Worker runs up to 900 s and writes the report directly to S3.
+    _lambda.invoke(
         FunctionName=worker_fn,
         InvocationType="Event",
         Payload=json.dumps(worker_payload).encode(),
     )
-    invoke_status = invoke_resp.get("StatusCode")
-    function_error = invoke_resp.get("FunctionError")
-
-    if invoke_status != 202:
-        logger.error(
-            "Unexpected invoke StatusCode=%s FunctionError=%s for session_id=%s",
-            invoke_status,
-            function_error,
-            session_id,
-        )
-        return _response(
-            500,
-            {
-                "error": f"Worker invocation returned unexpected status {invoke_status}",
-                "function_error": function_error,
-            },
-        )
-
-    if function_error:
-        # With InvocationType=Event this field is rarely set, but guard anyway.
-        logger.error(
-            "Worker FunctionError=%s session_id=%s",
-            function_error,
-            session_id,
-        )
 
     logger.info(
-        "Worker accepted | invoke_status=%s session_id=%s",
-        invoke_status,
+        "Fired worker for session_id=%s parent_session_id=%s",
         session_id,
+        parent_session_id or "none",
     )
 
     response_body: dict = {
