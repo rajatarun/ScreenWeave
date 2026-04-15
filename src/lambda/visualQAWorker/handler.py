@@ -163,14 +163,15 @@ def _make_batches(
 
 def _resize_image(data: bytes) -> bytes:
     """
-    Resize image so neither dimension exceeds MAX_IMG_DIMENSION pixels.
-    Returns original bytes unchanged if already within limits.
+    Resize image so the shortest edge equals MAX_IMG_DIMENSION pixels,
+    preserving aspect ratio. No-op if the shortest edge is already within limit.
     """
     img = Image.open(io.BytesIO(data))
     w, h = img.size
-    if w <= MAX_IMG_DIMENSION and h <= MAX_IMG_DIMENSION:
+    short_edge = min(w, h)
+    if short_edge <= MAX_IMG_DIMENSION:
         return data
-    scale = MAX_IMG_DIMENSION / max(w, h)
+    scale = MAX_IMG_DIMENSION / short_edge
     new_size = (int(w * scale), int(h * scale))
     logger.info("Resizing screenshot %dx%d → %dx%d", w, h, new_size[0], new_size[1])
     img = img.resize(new_size, Image.LANCZOS)
