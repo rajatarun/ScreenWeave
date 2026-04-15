@@ -417,7 +417,7 @@ def _build_consolidation_turn(total_states: int, total_batches: int) -> list[dic
 # ── Bedrock invocation ────────────────────────────────────────────────────────
 
 
-def _invoke_bedrock(messages: list[dict]) -> str:
+def _invoke_bedrock(messages: list[dict], max_tokens: int = 4096) -> str:
     """
     Call Claude via Bedrock with the full conversation history.
     Retries on ThrottlingException with exponential backoff.
@@ -426,7 +426,7 @@ def _invoke_bedrock(messages: list[dict]) -> str:
     body = json.dumps(
         {
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "system": _SYSTEM_PROMPT,
             "messages": messages,
         }
@@ -542,22 +542,27 @@ def _run_visual_qa(
             "content": _build_consolidation_turn(total_states, total_batches),
         }
     )
-    report_text = _invoke_bedrock(messages)
+    # Consolidation can produce large JSON for sessions with many states —
+    # use a generous token budget so the response is never truncated mid-JSON.
+    report_text = _invoke_bedrock(messages, max_tokens=16384)
     logger.info("Consolidation response received (%d chars)", len(report_text))
 
-    # Parse Claude's JSON output
+    # Parse Claude's JSON output, stripping markdown fences if present.
+    def _strip_fences(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            # Remove the opening fence line (```json or just ```)
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            # Remove the closing fence if present (tolerates truncated responses)
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3].rstrip()
+        return text.strip()
+
     try:
         report = json.loads(report_text)
     except json.JSONDecodeError:
-        # Claude occasionally wraps JSON in a code fence; attempt to strip it
-        stripped = report_text.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.split("```", 2)[1]
-            if stripped.startswith("json"):
-                stripped = stripped[4:]
-            stripped = stripped.rsplit("```", 1)[0].strip()
         try:
-            report = json.loads(stripped)
+            report = json.loads(_strip_fences(report_text))
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse Claude's JSON response: %s", exc)
             report = {
