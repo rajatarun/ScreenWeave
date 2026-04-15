@@ -206,7 +206,8 @@ export const handler = async (event) => {
       ? Buffer.from(event.body || '', 'base64').toString('utf8')
       : (event.body || '{}');
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    console.error(JSON.stringify({ level: 'ERROR', message: 'Invalid JSON-RPC payload', error: err.message }));
     return sseResponse(jsonRpcError(null, -32700, 'Parse error'));
   }
 
