@@ -56,6 +56,7 @@ DYNAMO_TABLE = os.environ.get("SCREENWEAVE_DYNAMO_TABLE", "")
 S3_BUCKET    = os.environ.get("SCREENWEAVE_S3_BUCKET", "")
 S3_PREFIX    = os.environ.get("SCREENWEAVE_S3_PREFIX", "screenweave")
 REGION       = os.environ.get("SCREENWEAVE_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+LOG_LEVEL    = os.environ.get("SCREENWEAVE_LOG_LEVEL", "INFO").upper()
 
 os.makedirs(SCREENS_DIR, exist_ok=True)
 
@@ -65,6 +66,28 @@ states      = []
 transitions = []
 state_ctr   = [0]
 prev_state  = [None]
+
+LOG_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+
+def _should_log(level: str) -> bool:
+    configured = LOG_LEVEL_ORDER.get(LOG_LEVEL, LOG_LEVEL_ORDER["INFO"])
+    requested = LOG_LEVEL_ORDER.get(level, LOG_LEVEL_ORDER["INFO"])
+    return requested >= configured
+
+
+def log(level: str, message: str, **fields) -> None:
+    if not _should_log(level):
+        return
+    payload = {
+        "level": level,
+        "message": message,
+        "service": "screenweave-crawler",
+        "session_id": SESSION_ID,
+        "timestamp": now_iso(),
+        **fields,
+    }
+    print(json.dumps(payload), flush=True)
 
 
 # ── DynamoDB helpers ──────────────────────────────────────────────────────────
@@ -98,10 +121,10 @@ def write_session_running():
                 ":ml":  {"N": str(MAX_LINKS)},
             },
         )
-        print(f"DynamoDB: status=RUNNING  ({SESSION_ID})", flush=True)
+        log("INFO", "Marked session RUNNING in DynamoDB", table_name=DYNAMO_TABLE)
     except Exception as e:
         # Non-fatal: log and continue. S3 artifacts are the source of truth.
-        print(f"DynamoDB WARN (running): {e}", flush=True)
+        log("WARN", "DynamoDB update failed for RUNNING status", error=str(e))
 
 
 def write_session_completed(summary_stats, artifact_manifest):
@@ -109,7 +132,6 @@ def write_session_completed(summary_stats, artifact_manifest):
     if not DYNAMO_TABLE:
         return
     try:
-        import json as _json
         client = _dynamo_client()
         now = now_iso()
 
@@ -156,9 +178,9 @@ def write_session_completed(summary_stats, artifact_manifest):
                 ":am": manifest_dynamo,
             },
         )
-        print(f"DynamoDB: status=COMPLETED ({SESSION_ID})", flush=True)
+        log("INFO", "Marked session COMPLETED in DynamoDB", table_name=DYNAMO_TABLE)
     except Exception as e:
-        print(f"DynamoDB WARN (completed): {e}", flush=True)
+        log("WARN", "DynamoDB update failed for COMPLETED status", error=str(e))
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -190,6 +212,7 @@ def internal(url: str) -> bool:
 # ── Page interactions ─────────────────────────────────────────────────────────
 
 async def scroll_page(page) -> None:
+    log("DEBUG", "Starting page scroll", page_url=page.url)
     total = await page.evaluate("document.body.scrollHeight")
     vh    = await page.evaluate("window.innerHeight")
     step  = max(vh // 3, 200)
@@ -200,13 +223,14 @@ async def scroll_page(page) -> None:
         pos += step
     await page.evaluate("window.scrollTo({top:0,behavior:'smooth'})")
     await asyncio.sleep(0.3)
+    log("DEBUG", "Completed page scroll", page_url=page.url, document_height=total)
 
 
 async def wait_for_idle(page, timeout: int = 5000) -> None:
     try:
         await page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception as e:
-        print(f"WARN wait_for_idle fallback after timeout/error: {e}", flush=True)
+        log("WARN", "wait_for_idle fallback after timeout/error", error=str(e))
         await asyncio.sleep(1.5)
 
 
@@ -253,7 +277,7 @@ async def capture_state(page, trigger_action: str = None, trigger_label: str = N
             "       .filter(t => t.length > 0)"
         )
     except Exception as e:
-        print(f"WARN metadata capture failed for {page.url}: {e}", flush=True)
+        log("WARN", "Metadata capture failed", page_url=page.url, error=str(e))
         scroll_y, doc_h, headings, links, preview, interactive = 0, 0, [], [], "", []
 
     state = {
@@ -272,7 +296,14 @@ async def capture_state(page, trigger_action: str = None, trigger_label: str = N
         "visible_text_preview":  preview.strip(),
     }
     states.append(state)
-    print(f"STATE {state_id} | {trigger_action} | {url} | {title!r}", flush=True)
+    log(
+        "INFO",
+        "Captured state",
+        state_id=state_id,
+        trigger_action=trigger_action,
+        page_url=url,
+        title=title,
+    )
 
     # Directed transition edge
     if prev_state[0] is not None:
@@ -327,7 +358,7 @@ async def click_interactive(page) -> None:
                         if urlparse(target).path != urlparse(page.url).path:
                             continue
                     clicked_labels.add(label)
-                    print(f"  CLICK [{sel}] -> {label!r}", flush=True)
+                    log("DEBUG", "Clicking interactive element", selector=sel, label=label, page_url=page.url)
                     await el.scroll_into_view_if_needed()
                     await asyncio.sleep(0.2)
                     await el.click(timeout=3000)
@@ -336,12 +367,12 @@ async def click_interactive(page) -> None:
                     await capture_state(page, trigger_action="click", trigger_label=label)
                     click_count += 1
                 except Exception as e:
-                    print(f"  CLICK ERR: {e}", flush=True)
+                    log("WARN", "Click interaction failed", selector=sel, page_url=page.url, error=str(e))
         except Exception as e:
-            print(f"WARN selector query failed [{sel}] on {page.url}: {e}", flush=True)
+            log("WARN", "Selector query failed", selector=sel, page_url=page.url, error=str(e))
 
     if click_count:
-        print(f"  Captured {click_count} click states on {page.url}", flush=True)
+        log("INFO", "Captured click states", page_url=page.url, click_states=click_count)
 
 
 # ── Page crawl ────────────────────────────────────────────────────────────────
@@ -351,16 +382,16 @@ async def crawl(page, url: str, depth: int) -> None:
         return
     seen.add(url)
     if urlparse(url).netloc != urlparse(BASE_URL).netloc:
-        print(f"SKIP external {url}")
+        log("DEBUG", "Skipping external URL", page_url=url, depth=depth)
         return
-    print(f"\nPAGE [{depth}] {url}", flush=True)
+    log("INFO", "Crawling page", depth=depth, page_url=url)
     try:
         await page.goto(url, wait_until="networkidle", timeout=25000)
         if urlparse(page.url).netloc != urlparse(BASE_URL).netloc:
-            print(f"SKIP redirect {page.url}")
+            log("WARN", "Skipping redirected external URL", page_url=page.url, source_url=url)
             return
     except Exception as e:
-        print(f"ERR navigating to {url}: {e}")
+        log("ERROR", "Navigation failed", page_url=url, error=str(e))
         return
 
     await asyncio.sleep(1)
@@ -374,6 +405,7 @@ async def crawl(page, url: str, depth: int) -> None:
         kids  = list(
             dict.fromkeys([h for h in hrefs if internal(h) and h not in seen])
         )[:MAX_LINKS]
+        log("DEBUG", "Discovered child links", page_url=page.url, child_count=len(kids), depth=depth)
         for child_url in kids:
             await crawl(page, child_url, depth + 1)
 
@@ -393,7 +425,7 @@ def card(path: str, l1: str, l2: str, l3: str = "") -> None:
     ], capture_output=True)
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        print(f"WARN failed to generate card {path}: {stderr}", flush=True)
+        log("WARN", "Failed to generate card", path=path, error=stderr)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -401,14 +433,19 @@ def card(path: str, l1: str, l2: str, l3: str = "") -> None:
 async def main() -> None:
     crawl_start = datetime.now(timezone.utc)
 
-    print(f"SESSION_ID : {SESSION_ID}", flush=True)
-    print(f"BASE_URL   : {BASE_URL}",   flush=True)
-    print(f"MAX_DEPTH  : {MAX_DEPTH}",  flush=True)
-    print(f"MAX_LINKS  : {MAX_LINKS}",  flush=True)
+    log(
+        "INFO",
+        "Crawler starting",
+        base_url=BASE_URL,
+        max_depth=MAX_DEPTH,
+        max_links=MAX_LINKS,
+        log_level=LOG_LEVEL,
+    )
 
     # Persist session ID for the calling bash script
     with open(f"{OUT_DIR}/.session_id", "w") as fh:
         fh.write(SESSION_ID)
+    log("DEBUG", "Persisted session ID file", path=f"{OUT_DIR}/.session_id")
 
     # ── Signal RUNNING to DynamoDB ────────────────────────────────────────────
     write_session_running()
@@ -421,16 +458,20 @@ async def main() -> None:
     )
 
     async with async_playwright() as pw:
+        log("INFO", "Launching Playwright Chromium")
         browser = await pw.chromium.launch(headless=True)
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 Chrome/122",
         )
         await ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
+        log("DEBUG", "Playwright tracing started", trace_path=TRACE_PATH)
         page = await ctx.new_page()
         await crawl(page, BASE_URL, 0)
         await ctx.tracing.stop(path=TRACE_PATH)
+        log("DEBUG", "Playwright tracing stopped", trace_path=TRACE_PATH)
         await browser.close()
+        log("INFO", "Closed Playwright browser")
 
     card(
         f"{OUT_DIR}/9999_outro.png",
@@ -452,6 +493,7 @@ async def main() -> None:
             fh,
             indent=2,
         )
+    log("INFO", "Wrote states manifest", path=f"{OUT_DIR}/states.json", total_states=len(states))
 
     # ── Write transitions manifest ────────────────────────────────────────────
     with open(f"{OUT_DIR}/transitions.json", "w") as fh:
@@ -464,11 +506,12 @@ async def main() -> None:
             fh,
             indent=2,
         )
+    log("INFO", "Wrote transitions manifest", path=f"{OUT_DIR}/transitions.json", total_transitions=len(transitions))
 
     crawl_end = datetime.now(timezone.utc)
     duration_sec = int((crawl_end - crawl_start).total_seconds())
 
-    print(f"\nDONE | {len(states)} states | {len(transitions)} transitions | {duration_sec}s", flush=True)
+    log("INFO", "Crawl complete", total_states=len(states), total_transitions=len(transitions), duration_seconds=duration_sec)
 
     # ── Build artifact_manifest for DynamoDB (state_id → {url, timestamp}) ───
     artifact_manifest = {
@@ -490,12 +533,12 @@ async def main() -> None:
     # ── Signal COMPLETED to DynamoDB ─────────────────────────────────────────
     write_session_completed(summary_stats, artifact_manifest)
 
-    print(f"SESSION_ID: {SESSION_ID}", flush=True)
+    log("INFO", "Crawler finished", session_id=SESSION_ID)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        print(f"FATAL crawler failed: {e}", flush=True)
+        log("ERROR", "FATAL crawler failure", error=str(e))
         raise
