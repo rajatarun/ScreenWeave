@@ -575,6 +575,269 @@ def _run_visual_qa(
     return report
 
 
+def _generate_html_report(
+    report: dict,
+    pairs: list[tuple[dict, str | None]],
+    bucket: str,
+) -> str:
+    """
+    Build a rich self-contained HTML QA report with embedded screenshots.
+
+    Each state gets a row in the findings table showing:
+      status badge | state ID | URL | screenshot thumbnail | observations | issues
+    """
+    findings_map = {f["state_id"]: f for f in report.get("findings", [])}
+
+    total        = len(pairs)
+    passed_count = sum(1 for f in report.get("findings", []) if f.get("passed"))
+    failed_count = total - passed_count
+    overall      = report.get("overall_status", "UNKNOWN")
+    session_id   = report.get("session_id", "")
+    generated_at = report.get("generated_at", "")
+    cross_batch  = report.get("cross_batch_observations", "")
+    all_issues   = report.get("all_issues", [])
+
+    status_colour = "#22c55e" if overall == "PASS" else "#ef4444"
+
+    # ── Screenshot thumbnails (re-use existing resize pipeline) ──────────────
+    thumbnails: dict[str, str] = {}
+    for state, key in pairs:
+        sid = state.get("state_id", "")
+        if key:
+            b64 = _download_b64(bucket, key)
+            if b64:
+                thumbnails[sid] = b64
+
+    # ── Table rows ────────────────────────────────────────────────────────────
+    rows: list[str] = []
+    for state, _ in pairs:
+        sid     = state.get("state_id", "")
+        url     = state.get("url", "")
+        finding = findings_map.get(sid, {})
+        passed  = finding.get("passed", True)
+        obs     = finding.get("observations", "—")
+        issues  = finding.get("issues", [])
+
+        badge = (
+            '<span class="badge pass">PASS</span>'
+            if passed else
+            '<span class="badge fail">FAIL</span>'
+        )
+        img_tag = (
+            f'<img src="data:image/png;base64,{thumbnails[sid]}" class="thumb" />'
+            if sid in thumbnails else
+            '<span class="no-img">—</span>'
+        )
+        issues_html = (
+            "<ul>" + "".join(f"<li>{i}</li>" for i in issues) + "</ul>"
+            if issues else "—"
+        )
+        row_cls = "pass-row" if passed else "fail-row"
+        short_url = url.replace("https://", "").replace("http://", "")
+        rows.append(f"""
+      <tr class="{row_cls}">
+        <td>{badge}</td>
+        <td class="mono">{sid}</td>
+        <td><a href="{url}" target="_blank" title="{url}">{short_url}</a></td>
+        <td class="img-cell">{img_tag}</td>
+        <td>{obs}</td>
+        <td>{issues_html}</td>
+      </tr>""")
+
+    rows_html = "\n".join(rows)
+
+    # ── All-issues summary ────────────────────────────────────────────────────
+    if all_issues:
+        issues_rows = "".join(
+            f'<tr><td class="mono">{i.get("state_id","")}</td>'
+            f'<td>{i.get("description","")}</td></tr>'
+            for i in all_issues
+        )
+        issues_section = f"""
+    <section>
+      <h2>All Issues ({len(all_issues)})</h2>
+      <table class="issues-table">
+        <thead><tr><th>State</th><th>Description</th></tr></thead>
+        <tbody>{issues_rows}</tbody>
+      </table>
+    </section>"""
+    else:
+        issues_section = ""
+
+    cross_section = (
+        f'<section><h2>Cross-batch Observations</h2><p>{cross_batch}</p></section>'
+        if cross_batch else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ScreenWeave QA — {session_id}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }}
+    a {{ color: #60a5fa; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+
+    header {{
+      background: #1e293b;
+      border-bottom: 3px solid {status_colour};
+      padding: 24px 32px;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }}
+    .overall-badge {{
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: {status_colour};
+      background: {status_colour}22;
+      border: 2px solid {status_colour};
+      border-radius: 8px;
+      padding: 6px 18px;
+      white-space: nowrap;
+    }}
+    .header-meta h1 {{ font-size: 1.1rem; color: #94a3b8; font-weight: 500; }}
+    .header-meta p  {{ font-size: 0.82rem; color: #64748b; margin-top: 2px; }}
+
+    .stats {{
+      display: flex;
+      gap: 16px;
+      padding: 20px 32px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }}
+    .stat {{
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 12px 20px;
+      text-align: center;
+      min-width: 100px;
+    }}
+    .stat .value {{ font-size: 1.8rem; font-weight: 700; }}
+    .stat .label {{ font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }}
+    .stat.green .value {{ color: #22c55e; }}
+    .stat.red   .value {{ color: #ef4444; }}
+    .stat.blue  .value {{ color: #60a5fa; }}
+
+    section {{ padding: 24px 32px; }}
+    section h2 {{ font-size: 1rem; font-weight: 600; color: #94a3b8;
+                  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 14px; }}
+    section p  {{ color: #cbd5e1; line-height: 1.6; }}
+
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+    th {{
+      background: #1e293b;
+      color: #94a3b8;
+      text-align: left;
+      padding: 10px 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: .04em;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    td {{ padding: 10px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }}
+    tr.pass-row {{ background: #0f2d1a; }}
+    tr.fail-row {{ background: #2d0f0f; }}
+    tr:hover td  {{ filter: brightness(1.15); }}
+
+    .badge {{
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }}
+    .badge.pass {{ background: #14532d; color: #22c55e; }}
+    .badge.fail {{ background: #450a0a; color: #ef4444; }}
+
+    .mono {{ font-family: ui-monospace, monospace; font-size: 0.8rem; color: #94a3b8; }}
+    .img-cell {{ width: 200px; }}
+    .thumb {{
+      max-width: 180px;
+      max-height: 140px;
+      border-radius: 4px;
+      border: 1px solid #334155;
+      display: block;
+    }}
+    .no-img {{ color: #475569; font-size: 0.8rem; }}
+
+    ul {{ padding-left: 16px; }}
+    li {{ color: #fca5a5; margin-bottom: 4px; line-height: 1.4; }}
+
+    .issues-table {{ margin-top: 0; }}
+    .issues-table th, .issues-table td {{ padding: 8px 12px; }}
+    .issues-table tr {{ background: #1e293b; }}
+    .issues-table tr:hover td {{ filter: brightness(1.2); }}
+
+    footer {{ padding: 16px 32px; color: #334155; font-size: 0.75rem; border-top: 1px solid #1e293b; }}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="overall-badge">{overall}</div>
+  <div class="header-meta">
+    <h1>ScreenWeave Visual QA Report</h1>
+    <p>Session: {session_id} &nbsp;·&nbsp; Generated: {generated_at}</p>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat blue">
+    <div class="value">{total}</div>
+    <div class="label">States</div>
+  </div>
+  <div class="stat green">
+    <div class="value">{passed_count}</div>
+    <div class="label">Passed</div>
+  </div>
+  <div class="stat red">
+    <div class="value">{failed_count}</div>
+    <div class="label">Failed</div>
+  </div>
+  <div class="stat blue">
+    <div class="value">{report.get("total_batches", "—")}</div>
+    <div class="label">Batches</div>
+  </div>
+</div>
+
+{cross_section}
+
+<section>
+  <h2>Findings ({total} states)</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>State</th>
+        <th>URL</th>
+        <th>Screenshot</th>
+        <th>Observations</th>
+        <th>Issues</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+</section>
+
+{issues_section}
+
+<footer>ScreenWeave · {session_id} · {generated_at}</footer>
+</body>
+</html>"""
+
+
 def _write_report(bucket: str, key: str, report: dict) -> None:
     """PUT the QA report JSON to S3."""
     body = json.dumps(report, indent=2).encode("utf-8")
@@ -674,8 +937,20 @@ def handler(event: dict, context) -> None:
             report["parent_session_id"] = parent_session_id
             report["parent_context_used"] = parent_summary is not None
 
-        # 5. Write report to S3
+        # 5. Write JSON report to S3
         _write_report(bucket, report_key, report)
+
+        # 6. Generate and write HTML report
+        html_key = report_key.replace(".json", ".html")
+        logger.info("Generating HTML report → s3://%s/%s", bucket, html_key)
+        html = _generate_html_report(report, pairs, bucket)
+        _s3.put_object(
+            Bucket=bucket,
+            Key=html_key,
+            Body=html.encode("utf-8"),
+            ContentType="text/html; charset=utf-8",
+        )
+        logger.info("HTML report written (%d bytes)", len(html))
 
     except FileNotFoundError as exc:
         logger.error("Artifact missing: %s", exc)
