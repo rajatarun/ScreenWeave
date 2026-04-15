@@ -205,7 +205,8 @@ async def scroll_page(page) -> None:
 async def wait_for_idle(page, timeout: int = 5000) -> None:
     try:
         await page.wait_for_load_state("networkidle", timeout=timeout)
-    except Exception:
+    except Exception as e:
+        print(f"WARN wait_for_idle fallback after timeout/error: {e}", flush=True)
         await asyncio.sleep(1.5)
 
 
@@ -251,7 +252,8 @@ async def capture_state(page, trigger_action: str = None, trigger_label: str = N
             "       .map(e => e.innerText.trim().slice(0,60))"
             "       .filter(t => t.length > 0)"
         )
-    except Exception:
+    except Exception as e:
+        print(f"WARN metadata capture failed for {page.url}: {e}", flush=True)
         scroll_y, doc_h, headings, links, preview, interactive = 0, 0, [], [], "", []
 
     state = {
@@ -335,8 +337,8 @@ async def click_interactive(page) -> None:
                     click_count += 1
                 except Exception as e:
                     print(f"  CLICK ERR: {e}", flush=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"WARN selector query failed [{sel}] on {page.url}: {e}", flush=True)
 
     if click_count:
         print(f"  Captured {click_count} click states on {page.url}", flush=True)
@@ -379,7 +381,7 @@ async def crawl(page, url: str, depth: int) -> None:
 # ── Title/outro cards ─────────────────────────────────────────────────────────
 
 def card(path: str, l1: str, l2: str, l3: str = "") -> None:
-    subprocess.run([
+    result = subprocess.run([
         "convert", "-size", "1280x800", "xc:#0d1117",
         "-fill", "#e6edf3", "-font", "DejaVu-Sans-Bold", "-pointsize", "56",
         "-gravity", "Center", "-annotate", "+0-80", l1,
@@ -389,6 +391,9 @@ def card(path: str, l1: str, l2: str, l3: str = "") -> None:
         "-gravity", "Center", "-annotate", "+0+100", l3,
         path,
     ], capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"WARN failed to generate card {path}: {stderr}", flush=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -488,4 +493,9 @@ async def main() -> None:
     print(f"SESSION_ID: {SESSION_ID}", flush=True)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"FATAL crawler failed: {e}", flush=True)
+        raise
