@@ -201,6 +201,66 @@ Resources:
       Roles:
         - !Ref CrawlerInstanceRole
 
+  # ── IAM: VisualQA Trigger Lambda execution role ─────────────────────────────
+  # Needs only lambda:InvokeFunction on the Worker so it can fire it async.
+  VisualQATriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-visualqa-trigger-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeWorker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt VisualQAWorkerFunction.Arn
+
+  # ── IAM: VisualQA Worker Lambda execution role ──────────────────────────────
+  # S3 read (screenshots + states.json) + S3 write (report) + Bedrock InvokeModel.
+  VisualQAWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-visualqa-worker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactsBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${ArtifactsBucket.Arn}/*'
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub >-
+                  arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0
+
   CrawlerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -254,6 +314,92 @@ Resources:
             Path: /mcp
             Method: GET
             ApiId: !Ref McpHttpApi
+      Tags:
+        Project: ScreenWeave
+
+  # ── Lambda: VisualQA Trigger ────────────────────────────────────────────────
+  # Sync entry-point (≤10s). Validates session_id, fires Worker asynchronously,
+  # returns 202 immediately so the REST API call never blocks on Claude.
+  VisualQATriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-visualqa-trigger'
+      RetentionInDays: 30
+
+  VisualQATriggerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: VisualQATriggerLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-visualqa-trigger'
+      Description: >
+        ScreenWeave Visual QA trigger. Validates session_id and fires the
+        VisualQA-Worker Lambda asynchronously; returns 202 immediately.
+      CodeUri: ../src/lambda/visualQATrigger/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Tracing: PassThrough
+      Role: !GetAtt VisualQATriggerRole.Arn
+      Environment:
+        Variables:
+          ARTIFACTS_BUCKET:     !Ref ArtifactsBucket
+          BUCKET_PREFIX:        screenweave
+          WORKER_FUNCTION_NAME: VisualQA-Worker
+      Events:
+        PostVisualQA:
+          Type: Api
+          Properties:
+            Path: /visual-qa
+            Method: POST
+            RestApiId: !Ref VisualQAApi
+      Tags:
+        Project: ScreenWeave
+
+  # ── Lambda: VisualQA Worker ─────────────────────────────────────────────────
+  # Async, long-running (up to 900s). Downloads screenshots from S3, runs a
+  # multi-turn Bedrock conversation with shared context across all batches,
+  # then writes qa_report.json back to S3.
+  VisualQAWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-visualqa-worker'
+      RetentionInDays: 30
+
+  VisualQAWorkerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: VisualQAWorkerLogGroup
+    Properties:
+      FunctionName: VisualQA-Worker
+      Description: >
+        ScreenWeave Visual QA worker. Downloads screenshots, drives a multi-turn
+        Claude 3.5 Sonnet conversation via Bedrock with shared context across
+        batches, writes qa_report.json to S3.
+      CodeUri: ../src/lambda/visualQAWorker/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 3008
+      Tracing: Active
+      Role: !GetAtt VisualQAWorkerRole.Arn
+      Environment:
+        Variables:
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          BUCKET_PREFIX:    screenweave
+      Tags:
+        Project: ScreenWeave
+
+  # ── API Gateway v1: Visual QA REST API ─────────────────────────────────────
+  # Separate from the MCP HTTP API. Stage v1 gives versioned URLs.
+  VisualQAApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      Description: ScreenWeave Visual QA REST API — POST /visual-qa to start a QA job
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'content-type'"
+        AllowMethods: "'POST,OPTIONS'"
       Tags:
         Project: ScreenWeave
 
@@ -331,3 +477,17 @@ Outputs:
     Value: !Ref SessionsTable
     Export:
       Name: !Sub '${AWS::StackName}-SessionsTable'
+
+  VisualQAEndpoint:
+    Description: >
+      Visual QA REST API — POST {"session_id": "..."} to start a QA job.
+      Returns 202 immediately; poll the report_s3_key for results.
+    Value: !Sub 'https://${VisualQAApi}.execute-api.${AWS::Region}.amazonaws.com/v1/visual-qa'
+    Export:
+      Name: !Sub '${AWS::StackName}-VisualQAEndpoint'
+
+  VisualQAWorkerFunctionName:
+    Description: VisualQA Worker Lambda function name
+    Value: !Ref VisualQAWorkerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-VisualQAWorkerFunction'
