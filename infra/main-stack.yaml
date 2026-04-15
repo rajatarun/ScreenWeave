@@ -204,7 +204,7 @@ Resources:
   CrawlerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ScreenWeave crawler EC2 – egress only, no inbound
+      GroupDescription: ScreenWeave crawler EC2 - egress only, no inbound
       Tags:
         - Key: Project
           Value: ScreenWeave
