@@ -60,6 +60,7 @@ const INSTANCE_TYPE        = process.env.CRAWLER_INSTANCE_TYPE || 't3.medium';
 const REGION               = process.env.AWS_REGION            || 'us-east-1';
 const CODE_BUCKET          = process.env.CRAWLER_CODE_BUCKET;
 const SIGNED_URL_EXPIRES   = parseInt(process.env.SIGNED_URL_EXPIRES_SECONDS || '3600', 10);
+const LOG_LEVEL            = (process.env.LOG_LEVEL || 'INFO').toUpperCase();
 
 // ── Validation constants ──────────────────────────────────────────────────────
 const URL_REGEX        = /^https?:\/\/[a-zA-Z0-9._-]+(?::\d+)?(?:\/[^\s]*)?$/;
@@ -71,6 +72,24 @@ const SIGN_BATCH_SIZE  = 25;
 // ── MCP protocol ──────────────────────────────────────────────────────────────
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 const JSONRPC_VERSION      = '2.0';
+
+const LOG_LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
+
+function shouldLog(level) {
+  const configured = LOG_LEVEL_ORDER[LOG_LEVEL] ?? LOG_LEVEL_ORDER.INFO;
+  const requested = LOG_LEVEL_ORDER[level] ?? LOG_LEVEL_ORDER.INFO;
+  return requested >= configured;
+}
+
+function log(level, message, fields = {}) {
+  if (!shouldLog(level)) return;
+  console.log(JSON.stringify({
+    level,
+    message,
+    service: 'screenweave-mcp',
+    ...fields,
+  }));
+}
 
 // ── Tool definitions (returned by tools/list) ─────────────────────────────────
 const TOOL_DEFINITIONS = [
@@ -181,6 +200,7 @@ const TOOL_DEFINITIONS = [
 // ── Lambda entry point ────────────────────────────────────────────────────────
 export const handler = async (event) => {
   const httpMethod = (event.requestContext?.http?.method || 'POST').toUpperCase();
+  log('INFO', 'Incoming MCP request', { http_method: httpMethod });
 
   // GET /mcp — return empty SSE stream for protocol negotiation / health check
   if (httpMethod === 'GET') {
@@ -207,12 +227,13 @@ export const handler = async (event) => {
       : (event.body || '{}');
     parsed = JSON.parse(raw);
   } catch (err) {
-    console.error(JSON.stringify({ level: 'ERROR', message: 'Invalid JSON-RPC payload', error: err.message }));
+    log('ERROR', 'Invalid JSON-RPC payload', { error: err.message });
     return sseResponse(jsonRpcError(null, -32700, 'Parse error'));
   }
 
   // Support JSON-RPC batches (array of requests)
   const requests = Array.isArray(parsed) ? parsed : [parsed];
+  log('DEBUG', 'Parsed JSON-RPC payload', { request_count: requests.length, is_batch: Array.isArray(parsed) });
   const responses = await Promise.all(requests.map(dispatchRpc));
   const valid = responses.filter(Boolean); // drop nulls from notifications
 
@@ -226,6 +247,7 @@ export const handler = async (event) => {
 
 // ── JSON-RPC dispatcher ───────────────────────────────────────────────────────
 async function dispatchRpc(req) {
+  log('DEBUG', 'Dispatching JSON-RPC request', { method: req?.method || null, id: req?.id ?? null });
   if (!req || req.jsonrpc !== JSONRPC_VERSION) {
     return jsonRpcError(req?.id ?? null, -32600, 'Invalid Request');
   }
@@ -257,7 +279,9 @@ async function dispatchRpc(req) {
 
       case 'tools/call': {
         if (!params?.name) return jsonRpcError(id, -32602, 'Missing tool name in params');
+        log('INFO', 'Invoking MCP tool', { tool_name: params.name, rpc_id: id ?? null });
         const result = await invokeTool(params.name, params.arguments || {});
+        log('INFO', 'Completed MCP tool', { tool_name: params.name, rpc_id: id ?? null });
         return jsonRpcOk(id, result);
       }
 
@@ -265,7 +289,7 @@ async function dispatchRpc(req) {
         return jsonRpcError(id, -32601, `Method not found: ${method}`);
     }
   } catch (err) {
-    console.error(JSON.stringify({ level: 'ERROR', method, message: err.message, stack: err.stack }));
+    log('ERROR', 'JSON-RPC dispatch failed', { method, error: err.message, stack: err.stack });
     // Application errors become JSON-RPC errors so the client sees them
     return jsonRpcError(id, -32603, err.message);
   }
@@ -298,8 +322,10 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
   const sessionId = randomUUID();
   const now       = new Date().toISOString();
   const ttl       = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7-day TTL
+  log('INFO', 'Validated crawl_url input', { session_id: sessionId, target_url: targetUrl, max_depth, max_links });
 
   // Write RUNNING record to DynamoDB
+  log('INFO', 'Writing RUNNING session to DynamoDB', { session_id: sessionId, table_name: TABLE_NAME });
   await dynamo.send(new PutItemCommand({
     TableName: TABLE_NAME,
     Item: marshall({
@@ -316,6 +342,7 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
   }));
 
   // Launch EC2 crawler
+  log('INFO', 'Building EC2 user-data and launching crawler instance', { session_id: sessionId, ami_id: AMI_ID, instance_type: INSTANCE_TYPE });
   const userDataBase64 = Buffer.from(
     buildUserData({ sessionId, targetUrl, region: REGION, table: TABLE_NAME, maxDepth: max_depth, maxLinks: max_links })
   ).toString('base64');
@@ -340,7 +367,7 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
   }));
 
   const instanceId = ec2Result.Instances[0].InstanceId;
-  console.log(JSON.stringify({ level: 'INFO', message: 'Crawl started', session_id: sessionId, instance_id: instanceId }));
+  log('INFO', 'Crawl started', { session_id: sessionId, instance_id: instanceId });
 
   return toolContent({
     session_id:  sessionId,
@@ -353,6 +380,7 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
 
 // ── Tool: get_session_status ──────────────────────────────────────────────────
 async function toolGetSessionStatus({ session_id }) {
+  log('DEBUG', 'Fetching session status', { session_id });
   const session = await fetchSession(session_id);
   return toolContent({
     session_id,
@@ -366,6 +394,7 @@ async function toolGetSessionStatus({ session_id }) {
 
 // ── Tool: get_screenshots ─────────────────────────────────────────────────────
 async function toolGetScreenshots({ session_id }) {
+  log('DEBUG', 'Fetching screenshots for session', { session_id });
   const session        = await fetchSession(session_id);
   const prefix         = `${BUCKET_PREFIX}/${session_id}`;
   const screenshotKeys = await listS3Objects(`${prefix}/screenshots/`);
@@ -404,6 +433,7 @@ async function toolGetScreenshots({ session_id }) {
 
 // ── Tool: get_metrics ─────────────────────────────────────────────────────────
 async function toolGetMetrics({ session_id }) {
+  log('DEBUG', 'Fetching metrics for session', { session_id });
   const session = await fetchSession(session_id);
 
   if (session.status !== 'COMPLETED') {
@@ -502,6 +532,7 @@ async function toolGetMetrics({ session_id }) {
 
 // ── Tool: get_full_session ────────────────────────────────────────────────────
 async function toolGetFullSession({ session_id, include = ['screenshots', 'states', 'transitions', 'trace'] }) {
+  log('DEBUG', 'Fetching full session bundle', { session_id, include });
   const session    = await fetchSession(session_id);
   const prefix     = `${BUCKET_PREFIX}/${session_id}`;
   const includeSet = new Set(include.map((s) => s.toLowerCase()));
@@ -544,6 +575,7 @@ async function fetchSession(session_id) {
   if (!session_id) throw new Error('Missing required parameter: session_id');
   if (!SESSION_ID_REGEX.test(session_id)) throw new Error('Invalid session_id format (4–64 alphanumeric/hyphen/underscore)');
 
+  log('DEBUG', 'Reading session from DynamoDB', { session_id, table_name: TABLE_NAME });
   const result = await dynamo.send(new GetItemCommand({
     TableName: TABLE_NAME,
     Key: { session_id: { S: `SESSION#${session_id}` } },
@@ -556,13 +588,14 @@ async function fetchSession(session_id) {
 // ── S3 helpers ────────────────────────────────────────────────────────────────
 async function signKey(key) {
   try {
+    log('DEBUG', 'Signing S3 object key', { key });
     return await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }),
       { expiresIn: SIGNED_URL_EXPIRES }
     );
   } catch (err) {
-    console.warn(JSON.stringify({ level: 'WARN', message: `Failed to sign: ${key}`, error: err.message }));
+    log('WARN', `Failed to sign: ${key}`, { error: err.message });
     return null;
   }
 }
@@ -577,6 +610,7 @@ async function signKeysBatched(keys) {
 }
 
 async function listS3Objects(prefix) {
+  log('DEBUG', 'Listing S3 objects', { bucket: BUCKET_NAME, prefix });
   const keys = [];
   let continuationToken;
 
@@ -596,6 +630,7 @@ async function listS3Objects(prefix) {
     }
     continuationToken = result.NextContinuationToken;
   } while (continuationToken);
+  log('DEBUG', 'Completed S3 listing', { prefix, key_count: keys.length });
 
   // Sort numerically by the first integer in the filename (state_0001, state_0002 …)
   return keys.sort((a, b) => {
@@ -626,6 +661,7 @@ DYNAMO_TABLE="${table}"
 REGION="${region}"
 MAX_DEPTH="${maxDepth}"
 MAX_LINKS="${maxLinks}"
+LOG_LEVEL="${LOG_LEVEL}"
 OUT_DIR="/opt/output"
 
 # IMDSv2 – fetch instance ID
@@ -637,6 +673,7 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \\
 echo "SESSION  : $SESSION_ID"
 echo "TARGET   : $TARGET_URL"
 echo "INSTANCE : $INSTANCE_ID"
+echo "LOGLEVEL : $LOG_LEVEL"
 
 mkdir -p "$OUT_DIR/screenshots"
 
@@ -664,6 +701,7 @@ export SCREENWEAVE_DYNAMO_TABLE="$DYNAMO_TABLE"
 export SCREENWEAVE_S3_BUCKET="$S3_BUCKET"
 export SCREENWEAVE_S3_PREFIX="$S3_PREFIX"
 export SCREENWEAVE_REGION="$REGION"
+export SCREENWEAVE_LOG_LEVEL="$LOG_LEVEL"
 
 python3 /opt/crawl.py "$TARGET_URL" || {
   aws dynamodb update-item \\
