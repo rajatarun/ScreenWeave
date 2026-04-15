@@ -20,6 +20,7 @@ Report is written to: s3://{bucket}/{prefix}/{session_id}/qa_report.json
 """
 
 import base64
+import io
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from PIL import Image
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -46,6 +48,10 @@ KEEP_FIELDS = frozenset(
 )
 
 MAX_IMG_BYTES = 5 * 1024 * 1024  # 5 MB — skip larger screenshots with a warning
+
+# Bedrock rejects any image dimension > 2000 px in multi-image requests.
+# Resize to this max on the longer edge, preserving aspect ratio.
+MAX_IMG_DIMENSION = 512
 
 # Bedrock ThrottlingException backoff schedule (seconds)
 _BACKOFF = (2, 4, 8)
@@ -155,9 +161,28 @@ def _make_batches(
     return [pairs[i : i + batch_size] for i in range(0, len(pairs), batch_size)]
 
 
+def _resize_image(data: bytes) -> bytes:
+    """
+    Resize image so neither dimension exceeds MAX_IMG_DIMENSION pixels.
+    Returns original bytes unchanged if already within limits.
+    """
+    img = Image.open(io.BytesIO(data))
+    w, h = img.size
+    if w <= MAX_IMG_DIMENSION and h <= MAX_IMG_DIMENSION:
+        return data
+    scale = MAX_IMG_DIMENSION / max(w, h)
+    new_size = (int(w * scale), int(h * scale))
+    logger.info("Resizing screenshot %dx%d → %dx%d", w, h, new_size[0], new_size[1])
+    img = img.resize(new_size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def _download_b64(bucket: str, key: str) -> str | None:
     """
-    Download a PNG from S3 and return its base64 representation.
+    Download a PNG from S3, resize if any dimension exceeds MAX_IMG_DIMENSION,
+    and return the base64 representation.
     Returns None on NoSuchKey or if the object exceeds MAX_IMG_BYTES.
     """
     try:
@@ -172,6 +197,7 @@ def _download_b64(bucket: str, key: str) -> str | None:
             )
             return None
         data = obj["Body"].read()
+        data = _resize_image(data)
         return base64.b64encode(data).decode("ascii")
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
