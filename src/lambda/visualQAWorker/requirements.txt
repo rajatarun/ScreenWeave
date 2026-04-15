@@ -1,1 +1,2 @@
-# boto3 is provided by the Lambda Python 3.12 runtime; no extra deps required.
+# boto3 is provided by the Lambda Python 3.12 runtime.
+Pillow==11.2.1
