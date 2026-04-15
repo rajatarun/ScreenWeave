@@ -51,7 +51,7 @@ MAX_IMG_BYTES = 5 * 1024 * 1024  # 5 MB — skip larger screenshots with a warni
 
 # Bedrock rejects any image dimension > 2000 px in multi-image requests.
 # Resize to this max on the longer edge, preserving aspect ratio.
-MAX_IMG_DIMENSION = 1568
+MAX_IMG_DIMENSION = 512
 
 # Bedrock ThrottlingException backoff schedule (seconds)
 _BACKOFF = (2, 4, 8)
