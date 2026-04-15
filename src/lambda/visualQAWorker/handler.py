@@ -36,7 +36,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 BATCH_SIZE = 10
 
-BEDROCK_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+BEDROCK_MODEL = "anthropic.claude-3-7-sonnet-20250219-v1:0"
 
 # Fields retained from each state object after pre-processing.
 # links_found and the screenshot relative path are intentionally excluded
