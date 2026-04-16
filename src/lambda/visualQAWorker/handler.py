@@ -55,7 +55,7 @@ BEDROCK_MODEL_SONNET = os.environ.get(
     "SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
 )
 BEDROCK_MODEL_HAIKU = os.environ.get(
-    "HAIKU_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+    "HAIKU_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
 BEDROCK_MODEL = BEDROCK_MODEL_SONNET  # backward-compat alias
 
