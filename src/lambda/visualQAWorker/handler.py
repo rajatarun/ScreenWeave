@@ -10,11 +10,19 @@ Flow:
   1. Discover artifacts  → list S3 keys under {prefix}/{session_id}/
   2. Pre-process         → fetch states.json, strip to minimal fields
   3. Pair screenshots    → match each state to its S3 screenshot key
-  4. Batch              → split into groups of BATCH_SIZE (default 10)
-  5. Multi-turn Bedrock  → for each batch, add a [user, assistant] turn;
-                           Claude carries shared context across all batches
-  6. Consolidate        → final turn asks Claude for the structured JSON report
-  7. Write report       → PUT qa_report.json to S3
+  4. Pre-download        → download + preprocess all screenshots; build image_store
+  5. Smart batch         → group by URL for temporal locality, adaptive batch size
+  6. Multi-turn Bedrock  → per-batch tier routing (heuristic / Haiku / Sonnet);
+                           cache lookup before each batch, store after consolidation
+  7. Consolidate        → final turn asks Claude for the structured JSON report
+  8. Write report       → PUT qa_report.json (+ qa_report.html) to S3
+
+Cost-optimisation principles implemented (see individual modules):
+  P1 – Stratified model routing      (image_classifier.py + _run_visual_qa)
+  P2 – Batch processing w/ locality  (_smart_batch)
+  P3 – Perceptual hash caching       (cache.py + _run_visual_qa)
+  P4 – Progressive enhancement       (image_classifier.py tiers)
+  P5 – Infrastructure optimisations  (preprocessor.py + _download_processed)
 
 Report is written to: s3://{bucket}/{prefix}/{session_id}/qa_report.json
 """
@@ -23,22 +31,41 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
 from PIL import Image
 
+import cache as _cache
+import image_classifier as _classifier
+import preprocessor as _preprocessor
+
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BATCH_SIZE = 10
+# Model IDs — Principle 1: Stratified Model Routing
+BEDROCK_MODEL_SONNET = os.environ.get(
+    "SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
+)
+BEDROCK_MODEL_HAIKU = os.environ.get(
+    "HAIKU_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+)
+BEDROCK_MODEL = BEDROCK_MODEL_SONNET  # backward-compat alias
 
-BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+# Feature flags (can be toggled via env vars without redeployment)
+ROUTING_ENABLED = os.environ.get("ROUTING_ENABLED", "true").lower() == "true"
+CACHE_ENABLED   = os.environ.get("CACHE_ENABLED",   "true").lower() == "true"
+CACHE_TABLE     = os.environ.get("CACHE_TABLE", "")
+
+# Pre-flight token budget per image — skip images that would cost too much
+MAX_TOKEN_COST_PER_IMAGE = int(os.environ.get("MAX_TOKENS_PER_IMAGE", "5000"))
 
 # Fields retained from each state object after pre-processing.
 # links_found and the screenshot relative path are intentionally excluded
@@ -49,17 +76,13 @@ KEEP_FIELDS = frozenset(
 
 MAX_IMG_BYTES = 5 * 1024 * 1024  # 5 MB — skip larger screenshots with a warning
 
-# Target short edge (drives scale for normal screenshots).
-MAX_IMG_DIMENSION = 512
-# Hard cap on the long edge — Bedrock rejects > 2000 px in multi-image requests.
-MAX_LONG_EDGE = 1568
-
 # Bedrock ThrottlingException backoff schedule (seconds)
 _BACKOFF = (2, 4, 8)
 
 # ── AWS clients (module-level for Lambda container reuse) ─────────────────────
 
-_s3 = boto3.client("s3")
+_s3      = boto3.client("s3")
+_dynamo  = boto3.client("dynamodb")
 _bedrock = boto3.client(
     "bedrock-runtime",
     region_name=os.environ.get("AWS_REGION", "us-east-1"),
@@ -155,47 +178,55 @@ def _pair_screenshots(
     return pairs
 
 
-def _make_batches(
-    pairs: list[tuple[dict, str | None]], batch_size: int = BATCH_SIZE
+def _smart_batch(
+    pairs: list[tuple[dict, str | None]],
 ) -> list[list[tuple[dict, str | None]]]:
-    """Chunk pairs into groups of batch_size."""
-    return [pairs[i : i + batch_size] for i in range(0, len(pairs), batch_size)]
-
-
-def _resize_image(data: bytes) -> bytes:
     """
-    Resize image preserving aspect ratio using two constraints:
-      1. Short edge → MAX_IMG_DIMENSION (512 px) for normal screenshots
-      2. Long edge  → MAX_LONG_EDGE (1568 px) hard cap for tall full-page captures
+    Principle 2: Batch processing with temporal locality.
 
-    Takes the more restrictive scale so neither limit is exceeded.
-    No-op if the image already satisfies both constraints.
+    Groups states by URL so Claude sees all screenshots of the same page
+    in a single batch (contextual similarity).  Within each URL group the
+    batch size is adaptive:
+      ≥ 8 states from the same page  → size 15 (scroll states, simpler)
+      3–7 states                     → size 10 (standard)
+      1–2 states                     → size 5  (isolated, may be complex)
 
-    Examples:
-      1280x720   → scale=0.71 (short-edge drives) → 910x512
-      1280x16937 → scale=0.09 (long-edge drives)  → 118x1568
+    States are already in temporal order from the crawler, so URL grouping
+    preserves chronological sequence within each page.
     """
-    img = Image.open(io.BytesIO(data))
-    w, h = img.size
-    scale = min(
-        MAX_IMG_DIMENSION / min(w, h),  # short-edge target
-        MAX_LONG_EDGE / max(w, h),      # long-edge hard cap
+    # Group by URL while preserving insertion order
+    groups: dict[str, list] = defaultdict(list)
+    for pair in pairs:
+        state, key = pair
+        groups[state.get("url", "")].append(pair)
+
+    batches: list[list] = []
+    for url, url_pairs in groups.items():
+        n = len(url_pairs)
+        size = 15 if n >= 8 else (10 if n >= 3 else 5)
+        for i in range(0, n, size):
+            batches.append(url_pairs[i : i + size])
+
+    logger.info(
+        "Smart batch: %d states across %d URLs → %d batches",
+        len(pairs), len(groups), len(batches),
     )
-    if scale >= 1.0:
-        return data
-    new_size = (int(w * scale), int(h * scale))
-    logger.info("Resizing screenshot %dx%d → %dx%d", w, h, new_size[0], new_size[1])
-    img = img.resize(new_size, Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    return batches
 
 
-def _download_b64(bucket: str, key: str) -> str | None:
+def _download_processed(
+    bucket: str, key: str
+) -> tuple[bytes | None, str, str | None]:
     """
-    Download a PNG from S3, resize if any dimension exceeds MAX_IMG_DIMENSION,
-    and return the base64 representation.
-    Returns None on NoSuchKey or if the object exceeds MAX_IMG_BYTES.
+    Principle 5: Download, preprocess (resize + format selection), and fingerprint.
+
+    Returns (processed_bytes_or_None, media_type, phash_or_None).
+
+    Processing steps:
+      1. Download raw bytes from S3; skip if > MAX_IMG_BYTES
+      2. preprocessor.preprocess() → resize to ≤1024px wide, PNG (UI) or JPEG 80% (photo)
+      3. Token pre-flight: skip if estimated tokens > MAX_TOKEN_COST_PER_IMAGE
+      4. cache.compute_phash() → 64-bit dHash for cache lookup
     """
     try:
         obj = _s3.get_object(Bucket=bucket, Key=key)
@@ -203,20 +234,32 @@ def _download_b64(bucket: str, key: str) -> str | None:
         if content_length > MAX_IMG_BYTES:
             logger.warning(
                 "Screenshot %s is %d bytes (> %d MB limit), skipping",
-                key,
-                content_length,
-                MAX_IMG_BYTES // (1024 * 1024),
+                key, content_length, MAX_IMG_BYTES // (1024 * 1024),
             )
-            return None
-        data = obj["Body"].read()
-        data = _resize_image(data)
-        return base64.b64encode(data).decode("ascii")
+            return None, "image/png", None
+        raw = obj["Body"].read()
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
         if code in ("NoSuchKey", "404"):
             logger.warning("Screenshot not found: %s", key)
-            return None
+            return None, "image/png", None
         raise
+
+    # Principle 5a: format selection + dimension capping
+    processed, media_type = _preprocessor.preprocess(raw)
+
+    # Principle 5b: token pre-flight cost check
+    token_est = _preprocessor.estimate_tokens(processed)
+    if token_est > MAX_TOKEN_COST_PER_IMAGE:
+        logger.warning(
+            "Screenshot %s: ~%d tokens exceeds limit of %d, skipping",
+            key, token_est, MAX_TOKEN_COST_PER_IMAGE,
+        )
+        return None, media_type, None
+
+    # Principle 3: perceptual fingerprint for cache lookup
+    phash = _cache.compute_phash(processed) if CACHE_ENABLED else None
+    return processed, media_type, phash
 
 
 # ── Parent session context ────────────────────────────────────────────────────
@@ -317,51 +360,58 @@ _SYSTEM_PROMPT = (
 
 def _build_batch_user_turn(
     batch: list[tuple[dict, str | None]],
-    images_b64: list[str | None],
+    images: list[tuple[str | None, str]],
     batch_index: int,
     total_batches: int,
+    cached_interpretations: dict[str, str] | None = None,
 ) -> list[dict]:
     """
     Build the content array for a single user turn covering one batch.
 
-    Structure: [image_block, ...] followed by one text_block containing
-    the screenshot index map, stripped metadata JSON, and QA instructions.
+    Principle 3: cached_interpretations maps state_id → prior analysis text.
+    For cached states, a text block replaces the image block (no image sent).
+    For uncached states, an image block is emitted with the correct media_type
+    (image/png or image/jpeg — Principle 5 format selection).
+
+    images is a list of (b64_or_None, media_type) parallel to batch.
     """
+    cached_interpretations = cached_interpretations or {}
     content: list[dict] = []
 
-    # Image blocks (skip None slots)
-    img_counter = 0
-    for img_b64 in images_b64:
-        if img_b64 is not None:
-            img_counter += 1
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": img_b64,
-                    },
-                }
-            )
+    # Emit cached-text blocks first, then image blocks
+    img_seq = 0
+    for (state, _), (b64, media_type) in zip(batch, images):
+        sid = state.get("state_id", "")
+        if sid in cached_interpretations:
+            content.append({
+                "type": "text",
+                "text": f"[CACHED ANALYSIS] {sid}: {cached_interpretations[sid]}",
+            })
+        elif b64 is not None:
+            img_seq += 1
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": b64,
+                },
+            })
 
     # Screenshot index map (helps Claude correlate images to state IDs)
     index_lines: list[str] = []
     img_seq = 0
-    for i, ((state, _), img_b64) in enumerate(zip(batch, images_b64)):
-        if img_b64 is not None:
+    for (state, _), (b64, _) in zip(batch, images):
+        sid = state.get("state_id", "")
+        url = state.get("url", "")
+        trigger = state.get("trigger_label") or "n/a"
+        if sid in cached_interpretations:
+            label = f"CACHED: {sid} | {url} | trigger: {trigger}"
+        elif b64 is not None:
             img_seq += 1
-            label = (
-                f"Image {img_seq}: {state.get('state_id')} | "
-                f"{state.get('url', '')} | "
-                f"trigger: {state.get('trigger_label') or 'n/a'}"
-            )
+            label = f"Image {img_seq}: {sid} | {url} | trigger: {trigger}"
         else:
-            label = (
-                f"MISSING: {state.get('state_id')} | "
-                f"{state.get('url', '')} | "
-                f"trigger: {state.get('trigger_label') or 'n/a'}"
-            )
+            label = f"MISSING: {sid} | {url} | trigger: {trigger}"
         index_lines.append(label)
 
     states_only = [state for state, _ in batch]
@@ -375,7 +425,7 @@ def _build_batch_user_turn(
         "STATE METADATA:\n"
         + metadata_json
         + "\n\n"
-        "Review the screenshots and metadata. Describe what you observe and flag any "
+        "Review the screenshots and cached analyses. Describe what you observe and flag any "
         "anomalies, regressions, or inconsistencies compared to previous batches.\n"
         "Respond in plain text — the JSON report comes in the final consolidation turn."
     )
@@ -417,12 +467,22 @@ def _build_consolidation_turn(total_states: int, total_batches: int) -> list[dic
 # ── Bedrock invocation ────────────────────────────────────────────────────────
 
 
-def _invoke_bedrock(messages: list[dict], max_tokens: int = 4096) -> str:
+def _invoke_bedrock(
+    messages: list[dict],
+    max_tokens: int = 4096,
+    model_id: str | None = None,
+) -> str:
     """
     Call Claude via Bedrock with the full conversation history.
+
+    Principle 1: model_id selects the routing tier at call time.
+      None / omitted → BEDROCK_MODEL_SONNET (default, highest quality)
+      BEDROCK_MODEL_HAIKU → cheaper, ~2–3× faster for routine batches
+
     Retries on ThrottlingException with exponential backoff.
     Returns the assistant's text response.
     """
+    effective_model = model_id or BEDROCK_MODEL_SONNET
     body = json.dumps(
         {
             "anthropic_version": "bedrock-2023-05-31",
@@ -435,11 +495,14 @@ def _invoke_bedrock(messages: list[dict], max_tokens: int = 4096) -> str:
     last_exc: Exception | None = None
     for attempt, delay in enumerate([0] + list(_BACKOFF)):
         if delay:
-            logger.info("Bedrock throttle retry %d, sleeping %ds", attempt, delay)
+            logger.info(
+                "Bedrock throttle retry %d (%s), sleeping %ds",
+                attempt, effective_model.split(".")[-1], delay,
+            )
             time.sleep(delay)
         try:
             resp = _bedrock.invoke_model(
-                modelId=BEDROCK_MODEL,
+                modelId=effective_model,
                 contentType="application/json",
                 accept="application/json",
                 body=body,
@@ -463,97 +526,198 @@ def _invoke_bedrock(messages: list[dict], max_tokens: int = 4096) -> str:
 
 def _run_visual_qa(
     batches: list[list[tuple[dict, str | None]]],
-    bucket: str,
+    image_store: dict[str, tuple[bytes | None, str, str | None]],
     parent_summary: str | None = None,
 ) -> dict:
     """
     Drive the multi-turn Bedrock conversation across all batches.
 
-    If parent_summary is provided it is injected as the first [user, assistant]
-    exchange so Claude has prior-session context before seeing any screenshots.
+    image_store maps state_id → (processed_bytes_or_None, media_type, phash_or_None)
+    and is built by the caller via _download_processed() so images are fetched once.
 
-    Returns the parsed QA report dict from Claude's final consolidation turn.
+    Integrates all five cost-efficiency principles:
+      P1 – Model routing: selects Haiku or Sonnet based on batch complexity
+      P2 – Smart batching: already applied by caller (_smart_batch)
+      P3 – Cache lookup before each batch; store per-state after consolidation
+      P4 – Tier routing: heuristic (no API) / Haiku / Sonnet
+      P5 – Preprocessed images (format + size) already in image_store
+
+    Returns the parsed QA report dict (with routing_stats attached).
     """
     messages: list[dict] = []
     total_batches = len(batches)
-    total_states = sum(len(b) for b in batches)
+    total_states  = sum(len(b) for b in batches)
+    stats = {"heuristic": 0, "haiku": 0, "sonnet": 0, "cache_hits": 0}
 
     # ── Inject parent context ─────────────────────────────────────────────────
     if parent_summary:
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Before we begin, here is a summary of a prior related QA session. "
-                            "Keep these findings in mind — they may help you spot regressions "
-                            "or confirm improvements in the current session.\n\n"
-                            f"PRIOR SESSION SUMMARY:\n{parent_summary}"
-                        ),
-                    }
-                ],
-            }
+        messages.append({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "Before we begin, here is a summary of a prior related QA session. "
+                    "Keep these findings in mind — they may help you spot regressions "
+                    "or confirm improvements in the current session.\n\n"
+                    f"PRIOR SESSION SUMMARY:\n{parent_summary}"
+                ),
+            }],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": (
+                "Understood. I've noted the prior session findings and will use them "
+                "as reference context when reviewing the current session — particularly "
+                "for regression detection and cross-session consistency."
+            ),
+        })
+        logger.info("Parent context injected (%d chars)", len(parent_summary))
+
+    # ── Process batches ───────────────────────────────────────────────────────
+    for batch_idx, batch in enumerate(batches):
+        logger.info("Processing batch %d/%d (%d states)", batch_idx + 1, total_batches, len(batch))
+
+        # Principle 3: cache lookup for every state in this batch
+        cached: dict[str, str] = {}
+        for state, _ in batch:
+            sid   = state.get("state_id", "")
+            entry = image_store.get(sid)
+            phash = entry[2] if entry else None
+            if phash and CACHE_ENABLED and CACHE_TABLE:
+                hit = _cache.lookup(phash, _dynamo, CACHE_TABLE)
+                if hit:
+                    cached[sid] = hit
+                    stats["cache_hits"] += 1
+
+        # Compute complexity only for states not already cached
+        uncached_complexities: list[float] = []
+        for state, _ in batch:
+            sid   = state.get("state_id", "")
+            if sid in cached:
+                continue
+            entry = image_store.get(sid)
+            if entry and entry[0]:
+                c = _classifier.compute_complexity_score(entry[0], state)
+            else:
+                c = 0.3  # default when no image available
+            uncached_complexities.append(c)
+
+        logger.info(
+            "  cached=%d uncached=%d",
+            len(cached), len(uncached_complexities),
         )
-        messages.append(
-            {
+
+        # ── Full cache hit: synthetic turn, no Bedrock call ───────────────────
+        if not uncached_complexities:
+            cached_lines = "\n\n".join(
+                f"[CACHED] {state.get('state_id','')}: {cached.get(state.get('state_id',''), '')}"
+                for state, _ in batch
+            )
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"--- BATCH {batch_idx + 1} of {total_batches} "
+                        f"(ALL {len(batch)} STATES FROM CACHE) ---\n\n"
+                        + cached_lines
+                    ),
+                }],
+            })
+            messages.append({
                 "role": "assistant",
                 "content": (
-                    "Understood. I've noted the prior session findings and will use them "
-                    "as reference context when reviewing the current session — particularly "
-                    "for regression detection and cross-session consistency."
+                    f"Noted. All {len(batch)} states in batch {batch_idx + 1} "
+                    "retrieved from cache — carrying forward."
                 ),
-            }
-        )
-        logger.info("Parent context injected into conversation (%d chars)", len(parent_summary))
+            })
+            logger.info("  Batch %d: full cache hit, no Bedrock call", batch_idx + 1)
+            continue
 
-    for batch_idx, batch in enumerate(batches):
-        logger.info(
-            "Processing batch %d/%d (%d states)",
-            batch_idx + 1,
-            total_batches,
-            len(batch),
-        )
+        # Principle 1 + 4: determine tier from max complexity of uncached states
+        max_complexity = max(uncached_complexities)
+        tier = _classifier.select_tier(max_complexity) if ROUTING_ENABLED else "sonnet"
+        logger.info("  max_complexity=%.3f → tier=%s", max_complexity, tier)
 
-        # Download screenshots for this batch
-        images_b64 = [
-            _download_b64(bucket, key) if key else None
-            for _, key in batch
-        ]
-        loaded = sum(1 for img in images_b64 if img is not None)
-        logger.info("  %d/%d screenshots loaded", loaded, len(batch))
+        # ── Tier 1: Heuristic — local assessment, no Bedrock ─────────────────
+        if tier == "heuristic":
+            heuristic_parts: list[str] = []
+            for state, _ in batch:
+                sid = state.get("state_id", "")
+                if sid not in cached:
+                    assessment = _classifier.heuristic_assessment(state)
+                    cached[sid] = assessment
+                    heuristic_parts.append(assessment)
+                    stats["heuristic"] += 1
 
-        # Build user turn and append
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"--- BATCH {batch_idx + 1} of {total_batches} (HEURISTIC TIER) ---\n\n"
+                        + "\n\n".join(heuristic_parts)
+                    ),
+                }],
+            })
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    f"Noted. {len(heuristic_parts)} states assessed at heuristic tier "
+                    "— all appear structurally standard for their page type."
+                ),
+            })
+            logger.info("  Batch %d: heuristic tier, %d states", batch_idx + 1, len(heuristic_parts))
+            continue
+
+        # ── Tier 2 / 3: Haiku or Sonnet — call Bedrock ───────────────────────
+        model_id = BEDROCK_MODEL_HAIKU if tier == "haiku" else BEDROCK_MODEL_SONNET
+
+        # Build (b64_or_None, media_type) for each state (cached → None)
+        images: list[tuple[str | None, str]] = []
+        for state, _ in batch:
+            sid   = state.get("state_id", "")
+            entry = image_store.get(sid)
+            if sid in cached or entry is None or entry[0] is None:
+                images.append((None, "image/png"))
+            else:
+                b64 = base64.b64encode(entry[0]).decode("ascii")
+                images.append((b64, entry[1]))
+
+        loaded = sum(1 for b64, _ in images if b64 is not None)
+        logger.info("  %d/%d screenshots loaded for Bedrock", loaded, len(batch))
+
         user_content = _build_batch_user_turn(
-            batch, images_b64, batch_idx, total_batches
+            batch, images, batch_idx, total_batches, cached
         )
         messages.append({"role": "user", "content": user_content})
 
-        # Get Claude's batch summary (plain text — shared context for next batch)
-        assistant_text = _invoke_bedrock(messages)
-        logger.info("  Batch %d summary received (%d chars)", batch_idx + 1, len(assistant_text))
+        assistant_text = _invoke_bedrock(messages, model_id=model_id)
+        logger.info(
+            "  Batch %d (%s) done (%d chars)", batch_idx + 1, tier, len(assistant_text)
+        )
         messages.append({"role": "assistant", "content": assistant_text})
 
-    # Final consolidation turn — request structured JSON report
-    messages.append(
-        {
-            "role": "user",
-            "content": _build_consolidation_turn(total_states, total_batches),
-        }
+        non_cached = len(batch) - len(cached)
+        if tier == "haiku":
+            stats["haiku"] += non_cached
+        else:
+            stats["sonnet"] += non_cached
+
+    # ── Final consolidation — always Sonnet for best report quality ───────────
+    messages.append({
+        "role": "user",
+        "content": _build_consolidation_turn(total_states, total_batches),
+    })
+    report_text = _invoke_bedrock(
+        messages, max_tokens=16384, model_id=BEDROCK_MODEL_SONNET
     )
-    # Consolidation can produce large JSON for sessions with many states —
-    # use a generous token budget so the response is never truncated mid-JSON.
-    report_text = _invoke_bedrock(messages, max_tokens=16384)
     logger.info("Consolidation response received (%d chars)", len(report_text))
 
-    # Parse Claude's JSON output, stripping markdown fences if present.
     def _strip_fences(text: str) -> str:
         text = text.strip()
         if text.startswith("```"):
-            # Remove the opening fence line (```json or just ```)
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            # Remove the closing fence if present (tolerates truncated responses)
             if text.rstrip().endswith("```"):
                 text = text.rstrip()[:-3].rstrip()
         return text.strip()
@@ -572,6 +736,25 @@ def _run_visual_qa(
                 "raw_response": report_text[:2000],
             }
 
+    # Principle 3: store per-state observations in cache after consolidation
+    if CACHE_ENABLED and CACHE_TABLE:
+        findings_map = {f.get("state_id"): f for f in report.get("findings", [])}
+        for batch in batches:
+            for state, _ in batch:
+                sid   = state.get("state_id", "")
+                entry = image_store.get(sid)
+                phash = entry[2] if entry else None
+                if not phash:
+                    continue
+                finding = findings_map.get(sid)
+                if finding and finding.get("observations"):
+                    _cache.store(phash, finding["observations"], _dynamo, CACHE_TABLE)
+
+    report["routing_stats"] = stats
+    logger.info(
+        "Routing summary: heuristic=%d haiku=%d sonnet=%d cache_hits=%d",
+        stats["heuristic"], stats["haiku"], stats["sonnet"], stats["cache_hits"],
+    )
     return report
 
 
@@ -599,14 +782,22 @@ def _generate_html_report(
 
     status_colour = "#22c55e" if overall == "PASS" else "#ef4444"
 
-    # ── Screenshot thumbnails (re-use existing resize pipeline) ──────────────
-    thumbnails: dict[str, str] = {}
+    # Routing stats for the cost-optimisation section
+    routing   = report.get("routing_stats", {})
+    cache_hits      = routing.get("cache_hits", 0)
+    haiku_count     = routing.get("haiku", 0)
+    sonnet_count    = routing.get("sonnet", 0)
+    heuristic_count = routing.get("heuristic", 0)
+
+    # ── Screenshot thumbnails ─────────────────────────────────────────────────
+    # Use _download_processed so thumbnails benefit from format/size optimisation.
+    thumbnails: dict[str, tuple[str, str]] = {}   # state_id → (b64, media_type)
     for state, key in pairs:
         sid = state.get("state_id", "")
         if key:
-            b64 = _download_b64(bucket, key)
-            if b64:
-                thumbnails[sid] = b64
+            proc, mt, _ = _download_processed(bucket, key)
+            if proc:
+                thumbnails[sid] = (base64.b64encode(proc).decode("ascii"), mt)
 
     # ── Table rows ────────────────────────────────────────────────────────────
     rows: list[str] = []
@@ -623,11 +814,11 @@ def _generate_html_report(
             if passed else
             '<span class="badge fail">FAIL</span>'
         )
-        img_tag = (
-            f'<img src="data:image/png;base64,{thumbnails[sid]}" class="thumb" />'
-            if sid in thumbnails else
-            '<span class="no-img">—</span>'
-        )
+        if sid in thumbnails:
+            thumb_b64, thumb_mt = thumbnails[sid]
+            img_tag = f'<img src="data:{thumb_mt};base64,{thumb_b64}" class="thumb" />'
+        else:
+            img_tag = '<span class="no-img">—</span>'
         issues_html = (
             "<ul>" + "".join(f"<li>{i}</li>" for i in issues) + "</ul>"
             if issues else "—"
@@ -808,6 +999,22 @@ def _generate_html_report(
     <div class="value">{report.get("total_batches", "—")}</div>
     <div class="label">Batches</div>
   </div>
+  <div class="stat green">
+    <div class="value">{cache_hits}</div>
+    <div class="label">Cached</div>
+  </div>
+  <div class="stat blue">
+    <div class="value">{heuristic_count}</div>
+    <div class="label">Heuristic</div>
+  </div>
+  <div class="stat blue">
+    <div class="value">{haiku_count}</div>
+    <div class="label">Haiku</div>
+  </div>
+  <div class="stat blue">
+    <div class="value">{sonnet_count}</div>
+    <div class="label">Sonnet</div>
+  </div>
 </div>
 
 {cross_section}
@@ -917,17 +1124,23 @@ def handler(event: dict, context) -> None:
         # 2. Pair each state with its expected screenshot key
         pairs = _pair_screenshots(stripped_states, bucket, prefix, session_id)
 
-        # 3. Batch
-        batches = _make_batches(pairs, BATCH_SIZE)
-        logger.info(
-            "%d states → %d batches of up to %d",
-            len(pairs),
-            len(batches),
-            BATCH_SIZE,
-        )
+        # 3. Pre-download + preprocess all screenshots (Principle 5)
+        # image_store: state_id → (processed_bytes_or_None, media_type, phash_or_None)
+        image_store: dict[str, tuple[bytes | None, str, str | None]] = {}
+        for state, key in pairs:
+            sid = state.get("state_id", "")
+            if key:
+                proc, mt, phash = _download_processed(bucket, key)
+                image_store[sid] = (proc, mt, phash)
+            else:
+                image_store[sid] = (None, "image/png", None)
+        logger.info("Pre-downloaded %d screenshots", len(image_store))
 
-        # 4. Run multi-turn Visual QA (parent_summary may be None — that's fine)
-        report = _run_visual_qa(batches, bucket, parent_summary=parent_summary)
+        # 4. Smart batch (Principle 2: temporal locality + URL grouping)
+        batches = _smart_batch(pairs)
+
+        # 5. Run multi-turn Visual QA (parent_summary may be None — that's fine)
+        report = _run_visual_qa(batches, image_store, parent_summary=parent_summary)
 
         # Stamp metadata onto the report
         report["session_id"] = session_id
