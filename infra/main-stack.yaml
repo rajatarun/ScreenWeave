@@ -295,9 +295,9 @@ Resources:
                   # Sonnet 4 — Tier 3 (complex reasoning, consolidation)
                   - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0'
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0'
-                  # Haiku 3 — Tier 2 (routine batches, supports vision, ~3× cheaper than Sonnet)
-                  - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-3-haiku-20240307-v1:0'
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-haiku-20240307-v1:0'
+                  # Haiku 4.5 — Tier 2 (routine batches, supports vision, cheaper than Sonnet)
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0'
 
   CrawlerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -425,7 +425,7 @@ Resources:
           ARTIFACTS_BUCKET:     !Ref ArtifactsBucket
           BUCKET_PREFIX:        screenweave
           CACHE_TABLE:          !Ref ScreenweaveCacheTable
-          HAIKU_MODEL_ID:       us.anthropic.claude-3-haiku-20240307-v1:0
+          HAIKU_MODEL_ID:       us.anthropic.claude-haiku-4-5-20251001-v1:0
           ROUTING_ENABLED:      "true"
           CACHE_ENABLED:        "true"
           MAX_TOKENS_PER_IMAGE: "5000"
