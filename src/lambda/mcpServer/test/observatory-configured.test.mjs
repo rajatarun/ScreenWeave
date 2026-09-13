@@ -1,9 +1,11 @@
 // Runs in its own process. Exercises withObservability with the shared
 // gate "on" (OBSERVATORY_METRICS_TABLE set) and, when @weaveaijs/mcp-observatory
 // is actually installed (as it will be after `npm install`, same as CI's
-// `sam build` step), against the real InvocationWrapper — guarding against
-// mcp-observatory@0.3.0's known bug where a rejected `call` gets its error
-// replaced by an internal TypeError (see observatory.mjs for detail).
+// `sam build` step), against the real InvocationWrapper — pinning the property
+// that a rejected `call` keeps its own error. That regressed in
+// mcp-observatory@0.3.0, which replaced it with an internal TypeError; the
+// package is now pinned to ^0.4.0 where it is fixed, and observatory.mjs keeps
+// a local guard regardless (see the comment there).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 

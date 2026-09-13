@@ -11,16 +11,19 @@
  * carries a hash of its arguments (never the raw arguments, which may
  * contain URLs or session identifiers).
  *
- * KNOWN UPSTREAM BUG (mcp-observatory@0.3.0, dist/core/wrapper.js): when the
- * wrapped `call` rejects, InvocationWrapper's own `finally` block does
+ * UPSTREAM BUG, fixed in 0.3.1/0.4.0 (mcp-observatory@0.3.0, dist/core/wrapper.js):
+ * when the wrapped `call` rejects, InvocationWrapper's own `finally` block did
  * `hashText(JSON.stringify(output))` where `output` is still `undefined`
  * (the assignment never ran) — `JSON.stringify(undefined)` is `undefined`,
  * and Node's `crypto.hash.update(undefined)` throws a TypeError. That
- * TypeError, thrown from a `finally`, REPLACES the tool's real error before
- * it ever reaches us. To avoid corrupting tool errors, `call` is never
- * allowed to reject through the wrapper: failures are caught locally, the
- * wrapper is fed a harmless placeholder, and the real error is rethrown
- * afterwards from the outcome we captured ourselves.
+ * TypeError, thrown from a `finally`, REPLACED the tool's real error before
+ * it ever reached us. This package is now pinned to ^0.4.0, where that is
+ * fixed, but the guard below is retained deliberately: it is cheap, and this
+ * module's contract is that telemetry can never alter a tool's outcome — which
+ * should not depend on the behaviour of whichever wrapper version resolves.
+ * So `call` is still never allowed to reject through the wrapper: failures are
+ * caught locally, the wrapper is fed a harmless placeholder, and the real error
+ * is rethrown afterwards from the outcome we captured ourselves.
  *
  * This module must never change tool behaviour or cause a call to fail:
  *   - OBSERVATORY_METRICS_TABLE unset       → call() runs unwrapped.
