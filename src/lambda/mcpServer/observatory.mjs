@@ -64,7 +64,12 @@ function hashArgs(args) {
 
 async function persistSpan({ toolName, argsHash, durationMs, outcome, errorMessage }) {
   if (!OBSERVATORY_METRICS_TABLE) return;
+  // One clock reading, reused for sk/timestamp AND span_date. Two separate
+  // `new Date()` calls can straddle midnight UTC and produce a row whose
+  // span_date disagrees with its timestamp -- invariant I7 -- indexing it
+  // under a day it did not happen on.
   const now = new Date().toISOString();
+  const spanDate = now.slice(0, 10);
   try {
     await dynamoClient().send(new PutItemCommand({
       TableName: OBSERVATORY_METRICS_TABLE,
@@ -78,6 +83,7 @@ async function persistSpan({ toolName, argsHash, durationMs, outcome, errorMessa
         duration_ms: { N: String(durationMs) },
         outcome:     { S: outcome },
         timestamp:   { S: now },
+        span_date:   { S: spanDate },
         ttl:         { N: String(Math.floor(Date.now() / 1000) + TTL_SECONDS) },
         ...(errorMessage ? { error: { S: errorMessage.slice(0, 500) } } : {}),
       },
