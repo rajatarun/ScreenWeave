@@ -8,8 +8,12 @@
 // each repository asserts its own writer against the vendored contract. This
 // file does that for ScreenWeave: it drives the REAL persistSpan/export path
 // through `withObservability` with the DynamoDB client mocked, captures the
-// actual PutItemCommand Item, and checks it with the same I1-I4 checks the
+// actual PutItemCommand Item, and checks it with the same I1-I8 checks the
 // Python siblings run (contracts/conformance.mjs is a port of conformance.py).
+//
+// v2.0.0: reads now go through the SpanTimelineIndex GSI (span_date +
+// timestamp) instead of the partition key, so a writer's pk is no longer what
+// determines whether its rows are visible. See the "v2" tests below.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -33,7 +37,7 @@ async function captureEmittedItem(toolName = 'crawl_url', args = { url: 'https:/
   return puts[0].input.Item;
 }
 
-test('the span ScreenWeave actually writes satisfies contract invariants I1-I4', async () => {
+test('the span ScreenWeave actually writes satisfies contract invariants I1-I8', async () => {
   const item = await captureEmittedItem();
 
   // checkItem unwraps the low-level AttributeValue shape ({ S: "..." }) that
@@ -69,59 +73,62 @@ test('I4: ttl is present and in the future so rows expire from the shared table'
 });
 
 // ---------------------------------------------------------------------------
-// Finding 2 — pinned as current truth, NOT as desired behaviour.
+// Finding 2 — HISTORICAL. Pre-v2, ScreenWeave's rows were durable, billable
+// and permanently invisible to every dashboard because readers queried the
+// partition key directly and enumerated OPERATION names, while ScreenWeave's
+// pk carried a TOOL name (`OBSERVATORY#crawl_url`) that no reader enumerated.
+// `readersFor`/pk-reachability is now a question about that pre-migration
+// shape, not about whether a row is visible today — see the v2 tests below,
+// which assert the opposite property using the actual reading path.
 // ---------------------------------------------------------------------------
 
-test('KNOWN GAP: ScreenWeave writes to a pk that no dashboard reader enumerates', async () => {
-  // observatory.mjs writes `pk: OBSERVATORY#${toolName}`. The OBSERVATORY
-  // namespace IS registered (so I2 above passes and nothing errors anywhere),
-  // but the contract declares its discriminator to be an OPERATION name, and
-  // both dashboard readers enumerate a fixed list of them:
-  //   invoke_agent, invoke_model, classify_question, synthesize_answer
-  // ScreenWeave puts a TOOL name there instead, so its rows land in partitions
-  // like OBSERVATORY#crawl_url that no reader ever queries. The rows are
-  // durable, billable and permanently invisible to every dashboard, and the
-  // failure is completely silent — the PutItem succeeds.
-  //
-  // Which naming scheme should win across the portfolio (teach the readers tool
-  // names, or make writers emit operation names) is an open PLATFORM decision,
-  // not something this repository can settle alone. This test therefore pins
-  // the current behaviour so the gap is a checked fact rather than folklore:
-  // if someone fixes the pk, or a reader is taught to enumerate tool names,
-  // this test fails and forces the change to be acknowledged here.
+test('HISTORICAL: under the pre-v2 pk-reachability model, ScreenWeave\'s pk had no reader', async () => {
+  // observatory.mjs still writes `pk: OBSERVATORY#${toolName}` — v2 makes the
+  // base-table pk the writer's own business, so this is unchanged and is not
+  // itself a defect any more. This test only pins what `readersFor` (the
+  // superseded, partition-key-based reachability model kept for archaeology)
+  // says about that pk, so a future reader that resurrects direct pk queries
+  // does not silently regain a false sense of visibility here.
   const item = await captureEmittedItem('crawl_url');
   const pk = item.pk.S;
 
-  assert.equal(pk, 'OBSERVATORY#crawl_url', 'writer still keys spans by tool name');
+  assert.equal(pk, 'OBSERVATORY#crawl_url', 'writer still keys its base-table pk by tool name');
 
   const contract = loadContract();
   const registry = contract.namespace_registry.OBSERVATORY;
-  assert.equal(registry.discriminator, 'operation', 'contract expects an operation discriminator');
-  assert.ok(
-    !registry.discriminator_values.includes('crawl_url'),
-    'crawl_url is not one of the operation names readers enumerate',
-  );
-
-  // The machine-readable form of "nothing will ever read this row".
+  assert.equal(registry.status, 'legacy-informational', 'namespace_registry is demoted in v2');
   assert.deepEqual(
     readersFor(pk),
     [],
-    'if this now returns readers, the Finding 2 gap has been closed — update this test',
-  );
-
-  // Contrast: a span keyed by a registered OPERATION name does have readers.
-  assert.ok(
-    readersFor('OBSERVATORY#invoke_model').length > 0,
-    'sanity check — the same namespace IS read when the discriminator is an operation name',
+    'readersFor is the historical pk-reachability model and still reports none for this pk',
   );
 });
 
-test('every MCP tool ScreenWeave exposes lands in an unread partition', async () => {
-  // Not one unlucky tool name — the whole surface is affected.
+test('v2: every MCP tool ScreenWeave exposes is in the SpanTimelineIndex regardless of pk', async () => {
+  // This is the fix: span_date + timestamp put every span in the GSI that
+  // readers now query, independent of whatever the pk says. Not one lucky
+  // tool name — the whole surface is affected.
+  const contract = loadContract();
+  const { partition_key: gsiPk, sort_key: gsiSk } = contract.gsi;
+
   for (const toolName of ['crawl_url', 'get_session_status', 'get_screenshots',
                           'get_metrics', 'get_full_session', 'export_session']) {
     const item = await captureEmittedItem(toolName, { session_id: 'x' });
-    assert.deepEqual(checkItem(item), [], `${toolName} span must still satisfy I1-I4`);
-    assert.deepEqual(readersFor(item.pk.S), [], `${toolName} span has no reader`);
+    assert.deepEqual(checkItem(item), [], `${toolName} span must satisfy I1-I8`);
+
+    const gsiPartitionValue = item[gsiPk]?.S;
+    const gsiSortValue = item[gsiSk]?.S;
+    assert.ok(gsiPartitionValue, `${toolName} span must carry the GSI partition key '${gsiPk}'`);
+    assert.ok(gsiSortValue, `${toolName} span must carry the GSI sort key '${gsiSk}'`);
+    assert.equal(
+      gsiSortValue.slice(0, 10),
+      gsiPartitionValue,
+      `${toolName} span's ${gsiSk} and ${gsiPk} must agree (I7) or it indexes under the wrong day`,
+    );
+
+    // The old pk-based reachability model still finds nothing here (unchanged
+    // by design — see the HISTORICAL test) — that is exactly why the GSI,
+    // not the pk, is now what makes this row visible.
+    assert.deepEqual(readersFor(item.pk.S), [], `${toolName} pk is still unread under the old model`);
   }
 });

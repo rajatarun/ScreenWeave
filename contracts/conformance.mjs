@@ -12,6 +12,12 @@
  * Deliberately dependency-free (node:fs + node:path only) so it can be vendored
  * into any consumer repository and run under `node --test` with no install step.
  *
+ * v2.0.0 adds I6-I8: span_date/timestamp/operation are the SpanTimelineIndex
+ * GSI's key attributes plus the field readers group on. A GSI indexes only
+ * items carrying both of its key attributes, so a writer that omits span_date
+ * or timestamp is exactly as invisible as a v1 writer with the wrong pk
+ * namespace -- these are now REQUIRED, not recommended.
+ *
  * Usage:
  *
  *   import { loadContract, checkItem, readersFor } from '../../contracts/conformance.mjs';
@@ -27,6 +33,8 @@ export const CONTRACT_FILENAME = 'observatory_metrics_item.json';
 // "{iso8601}#{trace_id}" -- the timestamp must sort first, so it is anchored.
 const SK_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?#.+$/;
 const PK_RE = /^([A-Z_]+)#(.+)$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 
 /** Read the contract JSON sitting beside this module unless told otherwise. */
 export function loadContract(path) {
@@ -108,6 +116,41 @@ export function checkItem(item, contract) {
   // I4 -- rows expire.
   if (!('ttl' in item)) {
     problems.push("I4: no 'ttl' attribute; rows would accumulate in a shared table forever");
+  }
+
+  // I6-I8 -- the SpanTimelineIndex key attributes. A GSI indexes only items
+  // that carry both of its keys, so a writer omitting either is invisible to
+  // every dashboard in exactly the way v1's pk-prefix mismatches were, except
+  // now it is a test failure instead of a silence.
+  const spanDate = unwrap(item.span_date);
+  const timestamp = unwrap(item.timestamp);
+  const operation = unwrap(item.operation);
+
+  if (!spanDate) {
+    problems.push(
+      "I6: no 'span_date'; the SpanTimelineIndex partition key is missing, so this " +
+      'row is not in the index and no dashboard will ever show it',
+    );
+  } else if (!DATE_RE.test(String(spanDate))) {
+    problems.push(`I6: span_date '${spanDate}' is not YYYY-MM-DD`);
+  }
+
+  if (!timestamp) {
+    problems.push(
+      "I7: no 'timestamp'; the SpanTimelineIndex sort key is missing, so this row is " +
+      'not in the index',
+    );
+  } else if (!TS_RE.test(String(timestamp))) {
+    problems.push(`I7: timestamp '${timestamp}' is not ISO 8601`);
+  } else if (spanDate && DATE_RE.test(String(spanDate)) && String(timestamp).slice(0, 10) !== String(spanDate)) {
+    problems.push(
+      `I7: timestamp '${timestamp}' and span_date '${spanDate}' disagree; the row ` +
+      'would be indexed under a day it did not happen on',
+    );
+  }
+
+  if (!operation) {
+    problems.push("I8: no 'operation'; readers filter and group on it");
   }
 
   return problems;
