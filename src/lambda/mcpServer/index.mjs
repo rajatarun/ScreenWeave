@@ -22,6 +22,10 @@
  *   get_metrics           – DynamoDB + states.json fetch + computed metrics
  *   get_full_session      – DynamoDB + S3 list + pre-signed URLs (full bundle)
  *
+ * Every tool call is wrapped by observatory.mjs, which records an invocation
+ * span (tool name, args hash, duration, outcome) to the shared
+ * OBSERVATORY_METRICS_TABLE when configured, and is a no-op otherwise.
+ *
  * MCP client config (no AWS credentials required by the caller):
  *   { "mcpServers": { "screenweave": { "url": "<McpEndpoint output>" } } }
  *
@@ -35,6 +39,7 @@
  *   CRAWLER_INSTANCE_TYPE        EC2 instance type (default: t3.medium)
  *   CRAWLER_CODE_BUCKET          Dedicated S3 bucket for crawl.py (key: crawler/crawl.py)
  *   SIGNED_URL_EXPIRES_SECONDS   Pre-signed URL TTL (default: 3600)
+ *   OBSERVATORY_METRICS_TABLE    Shared cross-project telemetry table (optional)
  */
 
 import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
@@ -43,6 +48,7 @@ import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/clien
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { randomUUID } from 'crypto';
+import { withObservability } from './observatory.mjs';
 
 // ── AWS SDK clients (reused across warm invocations) ──────────────────────────
 const dynamo = new DynamoDBClient({});
@@ -296,7 +302,14 @@ async function dispatchRpc(req) {
 }
 
 // ── Tool router ───────────────────────────────────────────────────────────────
+// Every dispatch is wrapped in an Observatory span (see observatory.mjs);
+// wrapping here at the single dispatch point covers all tools identically
+// and is a no-op when the shared gate isn't configured.
 async function invokeTool(name, args) {
+  return withObservability(name, args, () => dispatchTool(name, args));
+}
+
+async function dispatchTool(name, args) {
   switch (name) {
     case 'crawl_url':          return toolCrawlUrl(args);
     case 'get_session_status': return toolGetSessionStatus(args);
