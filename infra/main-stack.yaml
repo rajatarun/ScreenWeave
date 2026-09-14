@@ -577,6 +577,19 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-SessionsTable'
 
+  # The perceptual-hash cache had no Output, and it is the table that decides
+  # whether a vision call happens at all. A harness measuring cache behaviour,
+  # or clearing it between runs, has to be able to name it.
+  ScreenweaveCacheTableName:
+    Description: >-
+      DynamoDB perceptual-hash cache. Keyed by the 16-char dHash of a
+      screenshot, with a 72h TTL. A hit here skips the Bedrock vision call
+      entirely, so a test that does not clear it may be asserting against a
+      cached interpretation rather than a fresh one.
+    Value: !Ref ScreenweaveCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ScreenweaveCacheTable'
+
   VisualQAEndpoint:
     Description: >
       Visual QA REST API — POST {"session_id": "..."} to start a QA job.
