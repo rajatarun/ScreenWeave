@@ -27,6 +27,38 @@ Parameters:
     MaxValue: 43200
     Description: Pre-signed S3 URL TTL in seconds.
 
+  ObservatoryMetricsTableName:
+    Type: String
+    Default: ''
+    Description: >
+      Name of the shared cross-project Observatory metrics table (see
+      RoutineWeave), passed to the MCP server as OBSERVATORY_METRICS_TABLE.
+      Leave blank to disable telemetry — the InvocationWrapper is then never
+      invoked and every tool call runs exactly as before.
+
+  ObservatoryMetricsTableArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the table named by ObservatoryMetricsTableName, for IAM policy
+      scoping. Required (non-blank) whenever ObservatoryMetricsTableName is set.
+
+  ContextWeaveRawBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Name of the ContextWeave raw-ingestion S3 bucket. The export_session
+      tool writes to s3://<bucket>/raw/screenweave/<session_id>/. Leave
+      blank to disable export_session's S3 write permission; the tool then
+      returns a clear configuration error instead of failing on a missing grant.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ─────────────────────────────────────────────────────────────────────────────
+Conditions:
+  HasObservatoryMetricsTable: !Not [!Equals [!Ref ObservatoryMetricsTableName, '']]
+  HasContextWeaveRawBucket: !Not [!Equals [!Ref ContextWeaveRawBucketName, '']]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Globals (apply to all AWS::Serverless::Function resources)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +216,26 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: !GetAtt CrawlerInstanceRole.Arn
+        - !If
+          - HasObservatoryMetricsTable
+          - PolicyName: ObservatoryTelemetry
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: dynamodb:PutItem
+                  Resource: !Ref ObservatoryMetricsTableArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasContextWeaveRawBucket
+          - PolicyName: ContextWeaveExport
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub 'arn:aws:s3:::${ContextWeaveRawBucketName}/raw/screenweave/*'
+          - !Ref AWS::NoValue
 
   # ── IAM: EC2 crawler instance role ─────────────────────────────────────────
   CrawlerInstanceRole:
@@ -323,7 +375,9 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-mcp'
       Description: >
         ScreenWeave MCP server. Implements MCP JSON-RPC 2.0 over HTTP.
-        Tools: crawl_url, get_session_status, get_screenshots, get_metrics, get_full_session.
+        Tools: crawl_url, get_session_status, get_screenshots, get_metrics,
+        get_full_session, export_session. Every tool call is observed
+        through the shared Observatory gate when configured.
       CodeUri: ../src/lambda/mcpServer/
       Handler: index.handler
       Role: !GetAtt McpServerRole.Arn
@@ -339,6 +393,8 @@ Resources:
           CRAWLER_INSTANCE_TYPE:        !Ref CrawlerInstanceType
           CRAWLER_CODE_BUCKET:          !Ref CrawlerCodeBucket
           SIGNED_URL_EXPIRES_SECONDS:   !Ref SignedUrlExpiresSeconds
+          OBSERVATORY_METRICS_TABLE:    !Ref ObservatoryMetricsTableName
+          CONTEXTWEAVE_RAW_BUCKET:      !Ref ContextWeaveRawBucketName
       Events:
         PostMcp:
           Type: HttpApi

@@ -21,6 +21,11 @@
  *   get_screenshots       – DynamoDB + S3 list + pre-signed URLs
  *   get_metrics           – DynamoDB + states.json fetch + computed metrics
  *   get_full_session      – DynamoDB + S3 list + pre-signed URLs (full bundle)
+ *   export_session        – copy text/metadata artifacts to ContextWeave's raw/ prefix
+ *
+ * Every tool call is wrapped by observatory.mjs, which records an invocation
+ * span (tool name, args hash, duration, outcome) to the shared
+ * OBSERVATORY_METRICS_TABLE when configured, and is a no-op otherwise.
  *
  * MCP client config (no AWS credentials required by the caller):
  *   { "mcpServers": { "screenweave": { "url": "<McpEndpoint output>" } } }
@@ -35,6 +40,8 @@
  *   CRAWLER_INSTANCE_TYPE        EC2 instance type (default: t3.medium)
  *   CRAWLER_CODE_BUCKET          Dedicated S3 bucket for crawl.py (key: crawler/crawl.py)
  *   SIGNED_URL_EXPIRES_SECONDS   Pre-signed URL TTL (default: 3600)
+ *   OBSERVATORY_METRICS_TABLE    Shared cross-project telemetry table (optional)
+ *   CONTEXTWEAVE_RAW_BUCKET      ContextWeave raw ingestion bucket for export_session (optional)
  */
 
 import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
@@ -43,6 +50,8 @@ import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/clien
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { randomUUID } from 'crypto';
+import { withObservability } from './observatory.mjs';
+import { uploadSessionExport } from './exportSession.mjs';
 
 // ── AWS SDK clients (reused across warm invocations) ──────────────────────────
 const dynamo = new DynamoDBClient({});
@@ -61,6 +70,7 @@ const REGION               = process.env.AWS_REGION            || 'us-east-1';
 const CODE_BUCKET          = process.env.CRAWLER_CODE_BUCKET;
 const SIGNED_URL_EXPIRES   = parseInt(process.env.SIGNED_URL_EXPIRES_SECONDS || '3600', 10);
 const LOG_LEVEL            = (process.env.LOG_LEVEL || 'INFO').toUpperCase();
+const CONTEXTWEAVE_RAW_BUCKET = process.env.CONTEXTWEAVE_RAW_BUCKET || '';
 
 // ── Validation constants ──────────────────────────────────────────────────────
 const URL_REGEX        = /^https?:\/\/[a-zA-Z0-9._-]+(?::\d+)?(?:\/[^\s]*)?$/;
@@ -195,6 +205,22 @@ const TOOL_DEFINITIONS = [
       required: ['session_id'],
     },
   },
+  {
+    name: 'export_session',
+    description:
+      'Export a completed crawl session\'s extracted text/metadata artifacts to ContextWeave ' +
+      '(s3://<CONTEXTWEAVE_RAW_BUCKET>/raw/screenweave/<session_id>/) so its preprocessor can ' +
+      'ingest them: states.json and transitions.json verbatim, plus a synthesized summary.md. ' +
+      'Raw screenshots and the Playwright trace are not exported. ' +
+      'Requires CONTEXTWEAVE_RAW_BUCKET to be configured and the session to be COMPLETED.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Session ID returned by crawl_url' },
+      },
+      required: ['session_id'],
+    },
+  },
 ];
 
 // ── Lambda entry point ────────────────────────────────────────────────────────
@@ -296,13 +322,21 @@ async function dispatchRpc(req) {
 }
 
 // ── Tool router ───────────────────────────────────────────────────────────────
+// Every dispatch is wrapped in an Observatory span (see observatory.mjs);
+// wrapping here at the single dispatch point covers all tools identically
+// and is a no-op when the shared gate isn't configured.
 async function invokeTool(name, args) {
+  return withObservability(name, args, () => dispatchTool(name, args));
+}
+
+async function dispatchTool(name, args) {
   switch (name) {
     case 'crawl_url':          return toolCrawlUrl(args);
     case 'get_session_status': return toolGetSessionStatus(args);
     case 'get_screenshots':    return toolGetScreenshots(args);
     case 'get_metrics':        return toolGetMetrics(args);
     case 'get_full_session':   return toolGetFullSession(args);
+    case 'export_session':     return toolExportSession(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -570,6 +604,57 @@ async function toolGetFullSession({ session_id, include = ['screenshots', 'state
   });
 }
 
+// ── Tool: export_session ──────────────────────────────────────────────────────
+async function toolExportSession({ session_id }) {
+  log('DEBUG', 'Exporting session artifacts to ContextWeave', { session_id });
+
+  if (!CONTEXTWEAVE_RAW_BUCKET) {
+    throw new Error(
+      'CONTEXTWEAVE_RAW_BUCKET is not configured. Set the environment variable ' +
+      '(see the ContextWeaveRawBucketName SAM parameter) to enable export_session.'
+    );
+  }
+
+  const session = await fetchSession(session_id);
+  if (session.status !== 'COMPLETED') {
+    return toolContent({
+      session_id,
+      status:  session.status,
+      message: `Crawl is ${session.status}. export_session is available after COMPLETED.`,
+    });
+  }
+
+  const prefix = `${BUCKET_PREFIX}/${session_id}`;
+  const [statesText, transitionsText] = await Promise.all([
+    getS3Text(`${prefix}/states.json`),
+    getS3Text(`${prefix}/transitions.json`),
+  ]);
+  if (!statesText)      throw new Error('states.json not available for this session');
+  if (!transitionsText) throw new Error('transitions.json not available for this session');
+
+  const keys = await uploadSessionExport({
+    s3Client:   s3,
+    bucket:     CONTEXTWEAVE_RAW_BUCKET,
+    sessionId:  session_id,
+    statesText,
+    transitionsText,
+  });
+
+  log('INFO', 'Exported session artifacts to ContextWeave', { session_id, bucket: CONTEXTWEAVE_RAW_BUCKET, keys });
+
+  return toolContent({
+    session_id,
+    status:   session.status,
+    bucket:   CONTEXTWEAVE_RAW_BUCKET,
+    exported: Object.entries(keys).map(([artifact, key]) => ({
+      artifact,
+      key,
+      s3_uri: `s3://${CONTEXTWEAVE_RAW_BUCKET}/${key}`,
+    })),
+    message: 'Artifacts exported. ContextWeave\'s preprocessor ingests them on its next raw/ scan.',
+  });
+}
+
 // ── DynamoDB helpers ──────────────────────────────────────────────────────────
 async function fetchSession(session_id) {
   if (!session_id) throw new Error('Missing required parameter: session_id');
@@ -597,6 +682,17 @@ async function signKey(key) {
   } catch (err) {
     log('WARN', `Failed to sign: ${key}`, { error: err.message });
     return null;
+  }
+}
+
+/** Read an S3 object's body as UTF-8 text, or null if it doesn't exist. */
+async function getS3Text(key) {
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    return await res.Body.transformToString('utf-8');
+  } catch (err) {
+    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) return null;
+    throw err;
   }
 }
 
