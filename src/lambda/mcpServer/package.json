@@ -16,6 +16,6 @@
     "@aws-sdk/client-s3": "^3.731.0",
     "@aws-sdk/s3-request-presigner": "^3.731.0",
     "@aws-sdk/util-dynamodb": "^3.731.0",
-    "@weaveaijs/mcp-observatory": "^0.4.0"
+    "@weaveaijs/mcp-observatory": "^0.5.0"
   }
 }
