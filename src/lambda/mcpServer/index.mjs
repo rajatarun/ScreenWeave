@@ -50,6 +50,7 @@ import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/clien
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { randomUUID } from 'crypto';
+import { validateVideoRequest, startVideoJob } from './videoJob.mjs';
 import { withObservability } from './observatory.mjs';
 import { uploadSessionExport } from './exportSession.mjs';
 
@@ -60,6 +61,7 @@ const s3     = new S3Client({});
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const TABLE_NAME           = process.env.SESSIONS_TABLE;
+const VIDEO_WORKER_FUNCTION = process.env.VIDEO_WORKER_FUNCTION || '';
 const BUCKET_NAME          = process.env.ARTIFACTS_BUCKET;
 const BUCKET_PREFIX        = process.env.BUCKET_PREFIX        || 'screenweave';
 const AMI_ID               = process.env.CRAWLER_AMI_ID;
@@ -206,6 +208,42 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'generate_apple_video',
+    description:
+      'Produce a short Apple-style kinetic showcase video of a page.\n\n' +
+      'Pass either url (the page is captured fresh) or session_id (reuse a ' +
+      'completed crawl, which avoids capturing the same site twice and keeps ' +
+      'the QA report and the video describing the same page).\n\n' +
+      'Returns a job_id immediately; the render runs asynchronously. Poll ' +
+      'get_session_status with that job_id until COMPLETED or FAILED.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'Page to showcase (http or https). Mutually exclusive with session_id.',
+        },
+        session_id: {
+          type: 'string',
+          description: 'Reuse this completed crawl instead of capturing again.',
+        },
+        duration_s: {
+          type: 'integer',
+          minimum: 5,
+          maximum: 30,
+          default: 20,
+          description: 'Video length in seconds',
+        },
+        scale: {
+          type: 'integer',
+          enum: [1, 2, 3],
+          default: 3,
+          description: 'Capture device scale factor; 3 is Retina',
+        },
+      },
+    },
+  },
+  {
     name: 'export_session',
     description:
       'Export a completed crawl session\'s extracted text/metadata artifacts to ContextWeave ' +
@@ -337,6 +375,7 @@ async function dispatchTool(name, args) {
     case 'get_metrics':        return toolGetMetrics(args);
     case 'get_full_session':   return toolGetFullSession(args);
     case 'export_session':     return toolExportSession(args);
+    case 'generate_apple_video': return toolGenerateAppleVideo(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -410,6 +449,39 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
     instance_id: instanceId,
     message:     `Crawl started. Poll get_session_status(session_id="${sessionId}") until COMPLETED.`,
   });
+}
+
+// ── Tool: generate_apple_video ────────────────────────────────────────────────
+// The second engine. A render is a row in the same sessions table under the
+// same SESSION# key as a crawl, so get_session_status polls it unchanged and
+// no client learns a second protocol.
+async function toolGenerateAppleVideo(args) {
+  const request = validateVideoRequest(args);
+  const jobId   = randomUUID();
+  const now     = new Date().toISOString();
+  const ttl     = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+
+  const result = await startVideoJob({
+    request,
+    jobId,
+    now,
+    ttl,
+    workerFunction: VIDEO_WORKER_FUNCTION,
+    log,
+    putItem: (item) => dynamo.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(item, { removeUndefinedValues: true }),
+      ConditionExpression: 'attribute_not_exists(session_id)',
+    })),
+    invokeWorker: async () => {
+      // Reached only when VIDEO_WORKER_FUNCTION is set. The worker itself is
+      // the remaining piece of this engine; until it exists the job is
+      // recorded as NOT_CONFIGURED rather than promised an artifact.
+      throw new Error('VIDEO_WORKER_FUNCTION is set but no render worker is deployed yet');
+    },
+  });
+
+  return toolContent(result);
 }
 
 // ── Tool: get_session_status ──────────────────────────────────────────────────
