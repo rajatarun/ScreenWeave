@@ -82,8 +82,37 @@ const MAX_LINKS_LIMIT  = 30;
 const SIGN_BATCH_SIZE  = 25;
 
 // ── MCP protocol ──────────────────────────────────────────────────────────────
-const MCP_PROTOCOL_VERSION = '2024-11-05';
+//
+// `initialize` used to answer with '2024-11-05' whatever the client asked for,
+// which is not negotiation -- it is an assertion. A client that speaks a newer
+// revision reads that reply as "this server cannot talk to me" and hangs up.
+// Bedrock AgentCore Gateway does exactly that, and because it handshakes the
+// server while *creating* the GatewayTarget, the refusal surfaced as a
+// CloudFormation failure in a different repository:
+//
+//   GatewayTarget ... failed to stabilize, status: FAILED, reason: Failed to
+//   connect and fetch tools from the provided MCP target server.
+//   Error - Unsupported protocol version
+//
+// The spec's rule: answer with the client's requested version when the server
+// supports it, otherwise with the newest the server does support, and let the
+// client decide whether to continue. Every revision listed here carries the
+// same JSON-RPC surface this server implements (initialize, tools/list,
+// tools/call, ping) -- the revisions differ in transport, authorization and
+// features it does not offer -- so honouring any of them is truthful.
+//
+// An unknown version is NOT echoed. Claiming to speak a revision nobody here
+// has read is the same lie in the other direction, and the fallback gives the
+// client something real to reject.
+const MCP_SUPPORTED_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
+const MCP_PROTOCOL_VERSION = MCP_SUPPORTED_PROTOCOL_VERSIONS[MCP_SUPPORTED_PROTOCOL_VERSIONS.length - 1];
 const JSONRPC_VERSION      = '2.0';
+
+function negotiateProtocolVersion(requested) {
+  return MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+    ? requested
+    : MCP_PROTOCOL_VERSION;
+}
 
 const LOG_LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
 
@@ -325,12 +354,19 @@ async function dispatchRpc(req) {
 
   try {
     switch (method) {
-      case 'initialize':
+      case 'initialize': {
+        const negotiated = negotiateProtocolVersion(params?.protocolVersion);
+        log('INFO', 'MCP initialize', {
+          requested_protocol_version: params?.protocolVersion ?? null,
+          negotiated_protocol_version: negotiated,
+          client: params?.clientInfo?.name ?? null,
+        });
         return jsonRpcOk(id, {
-          protocolVersion: MCP_PROTOCOL_VERSION,
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
           serverInfo: { name: 'screenweave', version: '1.0.0' },
         });
+      }
 
       case 'notifications/initialized':
         return null;
