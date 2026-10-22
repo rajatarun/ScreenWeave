@@ -54,6 +54,10 @@ import { validateVideoRequest, startVideoJob } from './videoJob.mjs';
 import { withObservability } from './observatory.mjs';
 import { uploadSessionExport } from './exportSession.mjs';
 import { boundedInt, shellSafeB64, validateTargetUrl } from './crawlTarget.mjs';
+import {
+  WELL_KNOWN_PATH, authenticate, protectedResourceMetadata, requestUrl, requiredScope,
+  toolAllowed, wwwAuthenticate,
+} from './auth.mjs';
 
 // ── AWS SDK clients (reused across warm invocations) ──────────────────────────
 const dynamo = new DynamoDBClient({});
@@ -299,6 +303,15 @@ export const handler = async (event) => {
   const httpMethod = (event.requestContext?.http?.method || 'POST').toUpperCase();
   log('INFO', 'Incoming MCP request', { http_method: httpMethod });
 
+  // RFC 9728: how a client finds out which authorization server mints tokens
+  // for this service. Every 401 points here.
+  if (httpMethod === 'GET' && (event.rawPath || '').endsWith(WELL_KNOWN_PATH)) {
+    const doc = protectedResourceMetadata();
+    return doc
+      ? { statusCode: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=300' }, body: JSON.stringify(doc) }
+      : { statusCode: 404, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'no authorization server configured' }) };
+  }
+
   // GET /mcp — return empty SSE stream for protocol negotiation / health check
   if (httpMethod === 'GET') {
     return {
@@ -316,6 +329,22 @@ export const handler = async (event) => {
     };
   }
 
+  // Who is calling (auth.mjs). Decided before the body is read, so a refused
+  // request costs nothing but this check.
+  const { base } = requestUrl(event);
+  const auth = await authenticate(event);
+  if (!auth.ok) {
+    log('WARN', 'mcp auth rejected', { reason: auth.reason, auth_mode: auth.mode });
+    return authRefusal(401, auth.reason, base);
+  }
+  if (auth.principal) {
+    log('INFO', 'mcp auth', { method: 'jwt', sub: auth.principal.subject, jti: auth.principal.jti,
+      act: auth.principal.actors.join(',') || null, dpop: auth.principal.dpopBound });
+  } else {
+    // audit mode, no token. The line to count before switching AuthMode to enforce.
+    log('WARN', 'mcp auth', { method: 'none', auth_mode: auth.mode });
+  }
+
   // Parse JSON-RPC body
   let parsed;
   try {
@@ -331,7 +360,20 @@ export const handler = async (event) => {
   // Support JSON-RPC batches (array of requests)
   const requests = Array.isArray(parsed) ? parsed : [parsed];
   log('DEBUG', 'Parsed JSON-RPC payload', { request_count: requests.length, is_batch: Array.isArray(parsed) });
-  const responses = await Promise.all(requests.map(dispatchRpc));
+  // Each tool needs its scope. Refused as HTTP 403 before anything in the
+  // batch runs, so a batch is never half-executed.
+  for (const req of requests) {
+    if (req?.method !== 'tools/call' || !req.params?.name) continue;
+    const tool = req.params.name;
+    if (!auth.principal || toolAllowed(auth.principal, tool)) continue;
+    if (auth.mode === 'enforce') {
+      log('WARN', 'mcp tool refused', { tool_name: tool, reason: 'insufficient_scope', sub: auth.principal.subject });
+      return authRefusal(403, 'insufficient_scope', base, requiredScope(tool));
+    }
+    log('WARN', 'mcp tool scope audit', { tool_name: tool, missing_scope: requiredScope(tool), sub: auth.principal.subject });
+  }
+
+  const responses = await Promise.all(requests.map((req) => dispatchRpc(req, auth)));
   const valid = responses.filter(Boolean); // drop nulls from notifications
 
   if (valid.length === 0) {
@@ -343,7 +385,7 @@ export const handler = async (event) => {
 };
 
 // ── JSON-RPC dispatcher ───────────────────────────────────────────────────────
-async function dispatchRpc(req) {
+async function dispatchRpc(req, auth = { principal: null, mode: 'audit' }) {
   log('DEBUG', 'Dispatching JSON-RPC request', { method: req?.method || null, id: req?.id ?? null });
   if (!req || req.jsonrpc !== JSONRPC_VERSION) {
     return jsonRpcError(req?.id ?? null, -32600, 'Invalid Request');
@@ -379,11 +421,17 @@ async function dispatchRpc(req) {
         return jsonRpcOk(id, {});
 
       case 'tools/list':
-        return jsonRpcOk(id, { tools: TOOL_DEFINITIONS });
+        // Under enforce a token sees only what it can call.
+        return jsonRpcOk(id, {
+          tools: auth.mode === 'enforce' && auth.principal
+            ? TOOL_DEFINITIONS.filter((t) => toolAllowed(auth.principal, t.name))
+            : TOOL_DEFINITIONS,
+        });
 
       case 'tools/call': {
         if (!params?.name) return jsonRpcError(id, -32602, 'Missing tool name in params');
-        log('INFO', 'Invoking MCP tool', { tool_name: params.name, rpc_id: id ?? null });
+        log('INFO', 'Invoking MCP tool', { tool_name: params.name, rpc_id: id ?? null,
+          sub: auth.principal?.subject ?? null, jti: auth.principal?.jti ?? null });
         const result = await invokeTool(params.name, params.arguments || {});
         log('INFO', 'Completed MCP tool', { tool_name: params.name, rpc_id: id ?? null });
         return jsonRpcOk(id, result);
@@ -986,6 +1034,18 @@ function jsonRpcError(id, code, message) {
  * the client receives the complete event in one HTTP response.
  * Format: https://html.spec.whatwg.org/multipage/server-sent-events.html
  */
+/** 401/403 with an RFC 6750 challenge that names the resource metadata. */
+function authRefusal(status, reason, base, scope) {
+  return {
+    statusCode: status,
+    headers: {
+      'Content-Type': 'application/json',
+      'WWW-Authenticate': wwwAuthenticate({ error: status === 403 ? 'insufficient_scope' : 'invalid_token', scope, base }),
+    },
+    body: JSON.stringify({ error: status === 403 ? 'insufficient_scope' : 'unauthorized', reason }),
+  };
+}
+
 function sseResponse(payload) {
   const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
   return {
