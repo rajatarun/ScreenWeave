@@ -130,8 +130,16 @@ The Visual QA pipeline analyses a completed crawl session with Claude 3.5 Sonnet
 
 ### Start a QA job
 
+`POST /visual-qa` needs AWS IAM (SigV4) authentication: the caller's role
+must be allowed `execute-api:Invoke` on the API. Each job runs a 3 GB worker
+for up to 15 minutes with Bedrock calls, so the route is throttled (1 request
+per second, burst 2) and at most two workers run at once; further jobs queue.
+
 ```bash
 curl -X POST https://<VisualQAEndpoint> \
+  --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"session_id": "sess-abc123"}'
 ```
@@ -290,7 +298,7 @@ src/
     crawl.py               Playwright crawler (runs on EC2)
   lambda/
     mcpServer/
-      index.mjs            MCP JSON-RPC server (Node.js 20, HTTP API)
+      index.mjs            MCP JSON-RPC server (Node.js 24, HTTP API)
       observatory.mjs      Shared-gate telemetry wrapper (Observatory)
       exportSession.mjs    export_session → ContextWeave raw/ upload logic
       test/                node --test unit tests (npm test)

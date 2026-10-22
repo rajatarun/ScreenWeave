@@ -52,6 +52,14 @@ Parameters:
       blank to disable export_session's S3 write permission; the tool then
       returns a clear configuration error instead of failing on a missing grant.
 
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Address subscribed to the ops alerts topic (error lines in any function
+      log). Empty: the topic and alarm exist, with no email subscription. Set
+      with the repository variable ALERT_EMAIL.
+
   AuthMode:
     Type: String
     Default: audit
@@ -88,13 +96,14 @@ Parameters:
 Conditions:
   HasObservatoryMetricsTable: !Not [!Equals [!Ref ObservatoryMetricsTableName, '']]
   HasContextWeaveRawBucket: !Not [!Equals [!Ref ContextWeaveRawBucketName, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Globals (apply to all AWS::Serverless::Function resources)
 # ─────────────────────────────────────────────────────────────────────────────
 Globals:
   Function:
-    Runtime: nodejs20.x
+    Runtime: nodejs24.x
     Timeout: 29
     MemorySize: 512
     Tracing: Active
@@ -540,6 +549,10 @@ Resources:
       Timeout: 900
       MemorySize: 3008
       Tracing: Active
+      # Each run is up to 15 minutes at 3 GB plus Bedrock calls. Two at once
+      # is the ceiling on what a burst of /visual-qa requests can spend;
+      # further async invocations wait in Lambda's queue rather than run.
+      ReservedConcurrentExecutions: 2
       Role: !GetAtt VisualQAWorkerRole.Arn
       Environment:
         Variables:
@@ -560,9 +573,22 @@ Resources:
     Properties:
       StageName: v1
       Description: ScreenWeave Visual QA REST API — POST /visual-qa to start a QA job
+      # POST /visual-qa starts a 15-minute, 3 GB worker that calls Bedrock. It
+      # was open to anyone with the URL. No code calls it today, so it now
+      # needs a SigV4-signed request from a principal granted
+      # execute-api:Invoke on it (a Weave's Lambda role, or an operator), and
+      # is throttled behind that.
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        AddDefaultAuthorizerToCorsPreflight: false
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 2
       Cors:
         AllowOrigin: "'*'"
-        AllowHeaders: "'content-type'"
+        AllowHeaders: "'content-type,authorization,x-amz-date,x-amz-security-token,x-amz-content-sha256'"
         AllowMethods: "'POST,OPTIONS'"
       Tags:
         Project: ScreenWeave
@@ -610,6 +636,77 @@ Resources:
           "integrationLatency":"$context.integrationLatency"}
       Tags:
         Project: ScreenWeave
+
+  # ── Ops alerts: error lines in any function log ─────────────────────────────
+  # The MCP server catches its own exceptions and answers with a JSON-RPC
+  # error, so Lambda's Errors metric stays at 0 while a tool fails on every
+  # call. What each failure does leave is an ERROR line (Node logs JSON with
+  # "level":"ERROR", Python "[ERROR]"), so each function's log feeds one
+  # ErrorLines metric and one alarm watches it.
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ops-alerts'
+      KmsMasterKeyId: alias/aws/sns
+
+  OpsAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref OpsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  McpServerErrorLines:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref McpServerLogGroup
+      FilterPattern: '?ERROR ?"Task timed out" ?"Runtime.ExitError"'
+      MetricTransformations:
+        - MetricNamespace: ScreenWeave/Ops
+          MetricName: ErrorLines
+          MetricValue: '1'
+          Unit: Count
+
+  VisualQATriggerErrorLines:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref VisualQATriggerLogGroup
+      FilterPattern: '?"[ERROR]" ?"Task timed out" ?"Runtime.ExitError"'
+      MetricTransformations:
+        - MetricNamespace: ScreenWeave/Ops
+          MetricName: ErrorLines
+          MetricValue: '1'
+          Unit: Count
+
+  VisualQAWorkerErrorLines:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref VisualQAWorkerLogGroup
+      FilterPattern: '?"[ERROR]" ?"Task timed out" ?"Runtime.ExitError"'
+      MetricTransformations:
+        - MetricNamespace: ScreenWeave/Ops
+          MetricName: ErrorLines
+          MetricValue: '1'
+          Unit: Count
+
+  ErrorLinesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-error-lines'
+      AlarmDescription: >
+        A ScreenWeave function logged an error, timed out or crashed in the
+        last 5 minutes. Find it with Logs Insights over
+        /aws/lambda/screenweave-*: filter @message like /ERROR|Task timed out/.
+      Namespace: ScreenWeave/Ops
+      MetricName: ErrorLines
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
