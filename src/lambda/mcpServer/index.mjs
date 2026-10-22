@@ -45,7 +45,7 @@
  */
 
 import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
-import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
+import { DescribeInstancesCommand, EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
 import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
@@ -53,6 +53,7 @@ import { randomUUID } from 'crypto';
 import { validateVideoRequest, startVideoJob } from './videoJob.mjs';
 import { withObservability } from './observatory.mjs';
 import { uploadSessionExport } from './exportSession.mjs';
+import { boundedInt, shellSafeB64, validateTargetUrl } from './crawlTarget.mjs';
 
 // ── AWS SDK clients (reused across warm invocations) ──────────────────────────
 const dynamo = new DynamoDBClient({});
@@ -73,9 +74,12 @@ const CODE_BUCKET          = process.env.CRAWLER_CODE_BUCKET;
 const SIGNED_URL_EXPIRES   = parseInt(process.env.SIGNED_URL_EXPIRES_SECONDS || '3600', 10);
 const LOG_LEVEL            = (process.env.LOG_LEVEL || 'INFO').toUpperCase();
 const CONTEXTWEAVE_RAW_BUCKET = process.env.CONTEXTWEAVE_RAW_BUCKET || '';
+// Crawler instances allowed at once. Each is an EC2 instance billed by the
+// second until it terminates itself; without a cap a caller can start as
+// many as the account's vCPU quota allows.
+const MAX_CONCURRENT_CRAWLERS = parseInt(process.env.MAX_CONCURRENT_CRAWLERS || '3', 10);
 
 // ── Validation constants ──────────────────────────────────────────────────────
-const URL_REGEX        = /^https?:\/\/[a-zA-Z0-9._-]+(?::\d+)?(?:\/[^\s]*)?$/;
 const SESSION_ID_REGEX = /^[a-zA-Z0-9_-]{4,64}$/;
 const MAX_DEPTH_LIMIT  = 3;
 const MAX_LINKS_LIMIT  = 30;
@@ -418,16 +422,11 @@ async function dispatchTool(name, args) {
 
 // ── Tool: crawl_url ───────────────────────────────────────────────────────────
 async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
-  if (!url || typeof url !== 'string')
-    throw new Error('url is required (string)');
-  if (!URL_REGEX.test(url.trim()))
-    throw new Error('url must be a valid http(s) URL');
-  if (typeof max_depth !== 'number' || max_depth < 0 || max_depth > MAX_DEPTH_LIMIT)
-    throw new Error(`max_depth must be 0–${MAX_DEPTH_LIMIT}`);
-  if (typeof max_links !== 'number' || max_links < 1 || max_links > MAX_LINKS_LIMIT)
-    throw new Error(`max_links must be 1–${MAX_LINKS_LIMIT}`);
+  const targetUrl = validateTargetUrl(url);
+  boundedInt(max_depth, 'max_depth', 0, MAX_DEPTH_LIMIT);
+  boundedInt(max_links, 'max_links', 1, MAX_LINKS_LIMIT);
+  await assertCrawlerCapacity();
 
-  const targetUrl = url.trim();
   const sessionId = randomUUID();
   const now       = new Date().toISOString();
   const ttl       = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7-day TTL
@@ -465,6 +464,9 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
     SecurityGroupIds: [SG_ID],
     UserData: userDataBase64,
     InstanceInitiatedShutdownBehavior: 'terminate',
+    // IMDSv2 only, one hop: a page the crawler loads cannot read the
+    // instance's role credentials with a plain GET to 169.254.169.254.
+    MetadataOptions: { HttpTokens: 'required', HttpPutResponseHopLimit: 1, HttpEndpoint: 'enabled' },
     TagSpecifications: [{
       ResourceType: 'instance',
       Tags: [
@@ -852,19 +854,41 @@ async function listS3Objects(prefix) {
  * crawl.py is downloaded from CrawlerCodeBucket at boot time (uploaded by the CI workflow).
  * Key: crawler/crawl.py
  */
-function buildUserData({ sessionId, targetUrl, region, table, maxDepth, maxLinks }) {
+/**
+ * Fail before launching when MAX_CONCURRENT_CRAWLERS crawler instances are
+ * already pending or running.
+ */
+async function assertCrawlerCapacity() {
+  const out = await ec2.send(new DescribeInstancesCommand({
+    Filters: [
+      { Name: 'tag:Project', Values: ['ScreenWeave'] },
+      { Name: 'tag-key', Values: ['SessionId'] },
+      { Name: 'instance-state-name', Values: ['pending', 'running'] },
+    ],
+  }));
+  const active = (out.Reservations || []).reduce((n, r) => n + (r.Instances || []).length, 0);
+  if (active >= MAX_CONCURRENT_CRAWLERS)
+    throw new Error(`${active} crawls are already running (limit ${MAX_CONCURRENT_CRAWLERS}); try again when one finishes`);
+}
+
+/**
+ * The crawler's boot script. No caller-supplied value is interpolated: the
+ * target URL is passed base64-encoded inside single quotes and decoded on the
+ * instance, and the depth and link limits are validated integers.
+ */
+export function buildUserData({ sessionId, targetUrl, region, table, maxDepth, maxLinks }) {
   return `#!/bin/bash
 set -euxo pipefail
 exec > /var/log/screenweave-crawler.log 2>&1
 
 SESSION_ID="${sessionId}"
-TARGET_URL="${targetUrl}"
+TARGET_URL="$(printf '%s' '${shellSafeB64(targetUrl)}' | base64 -d)"
 S3_BUCKET="${BUCKET_NAME}"
 S3_PREFIX="${BUCKET_PREFIX}"
 DYNAMO_TABLE="${table}"
 REGION="${region}"
-MAX_DEPTH="${maxDepth}"
-MAX_LINKS="${maxLinks}"
+MAX_DEPTH="${Number(maxDepth)}"
+MAX_LINKS="${Number(maxLinks)}"
 LOG_LEVEL="${LOG_LEVEL}"
 OUT_DIR="/opt/output"
 

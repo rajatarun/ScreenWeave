@@ -210,8 +210,25 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # RunInstances also authorises the image, subnet, network
+              # interface, security group and volume, which carry no
+              # instance type; IfExists applies the limit to the instance.
+              # A caller cannot launch anything larger than the crawler size.
               - Effect: Allow
-                Action: [ec2:RunInstances, ec2:CreateTags]
+                Action: ec2:RunInstances
+                Resource: '*'
+                Condition:
+                  StringEqualsIfExists:
+                    ec2:InstanceType: [t3.small, t3.medium, t3.large]
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+              # Counts running crawlers for MAX_CONCURRENT_CRAWLERS.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
                 Resource: '*'
               - Effect: Allow
                 Action: iam:PassRole
@@ -268,9 +285,15 @@ Resources:
               - Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !GetAtt SessionsTable.Arn
+              # Each crawler terminates itself when done. It was allowed to
+              # terminate any instance in the account (Memgraph included);
+              # now only ScreenWeave's own crawlers.
               - Effect: Allow
                 Action: ec2:TerminateInstances
-                Resource: '*'
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Project: ScreenWeave
 
   CrawlerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -395,6 +418,7 @@ Resources:
           SIGNED_URL_EXPIRES_SECONDS:   !Ref SignedUrlExpiresSeconds
           OBSERVATORY_METRICS_TABLE:    !Ref ObservatoryMetricsTableName
           CONTEXTWEAVE_RAW_BUCKET:      !Ref ContextWeaveRawBucketName
+          MAX_CONCURRENT_CRAWLERS:      "3"
       Events:
         PostMcp:
           Type: HttpApi

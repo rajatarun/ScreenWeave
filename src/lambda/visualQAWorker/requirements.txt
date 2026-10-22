@@ -1,2 +1,2 @@
 # boto3 is provided by the Lambda Python 3.12 runtime.
-Pillow==11.2.1
+Pillow==13.0.0
