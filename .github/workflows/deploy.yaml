@@ -34,10 +34,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: src/lambda/mcpServer/package-lock.json
       - name: MCP server tests
@@ -45,12 +45,12 @@ jobs:
         run: |
           npm ci
           npm test
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Python tests
         run: |
-          python -m pip install pytest boto3 -r src/lambda/visualQAWorker/requirements.txt
+          python -m pip install pytest boto3 pyyaml -r src/lambda/visualQAWorker/requirements.txt
           python -m pytest -q tests
 
   # Known-vulnerable dependencies block the deploy, like a red test. The
@@ -63,14 +63,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: '24'
       - name: npm audit (MCP server, production dependencies)
         working-directory: src/lambda/mcpServer
         run: npm audit --omit=dev --audit-level=high
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: pip-audit (Visual QA Lambdas)
@@ -92,7 +92,7 @@ jobs:
       GITLEAKS_VERSION: 8.28.0
       GITLEAKS_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install gitleaks
@@ -114,28 +114,28 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # No long-lived AWS keys. ASSUME_ROLE_ARN is set in:
       # Settings → Secrets and variables → Variables
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.ASSUME_ROLE_ARN }}
           aws-region: ${{ env.REGION }}
           mask-aws-account-id: true
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: src/lambda/mcpServer/package-lock.json
 
       # sam build: runs npm install --production in src/lambda/mcpServer/,
       # copies built artifacts to .aws-sam/build/, resolves CodeUri paths.
       - name: SAM build
-        uses: aws-actions/setup-sam@v2
+        uses: aws-actions/setup-sam@341eee193f458fa5aae5d52c94b0c5cf3a1c5a52 # v3
         with:
           use-installer: true
 
@@ -201,8 +201,19 @@ jobs:
       # sam deploy --resolve-s3: SAM creates and manages its own deployment
       # bucket automatically — no bucket parameters needed.
       # All S3 buckets (ArtifactsBucket, CrawlerCodeBucket) are created by CFN.
+      # repo=ScreenWeave is copied by CloudFormation onto every resource, so
+      # Cost Explorer can attribute spend (activate the tag as a cost
+      # allocation tag once). Ops alerts go to the repository variable
+      # ALERT_EMAIL; unset keeps the topic with no subscriber.
       - name: Deploy
+        env:
+          ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
         run: |
+          if [ -n "$ALERT_EMAIL" ]; then
+            ALERT_ARG="AlertEmail=$ALERT_EMAIL"
+          else
+            ALERT_ARG='ParameterKey=AlertEmail,ParameterValue=""'
+          fi
           sam deploy \
             --stack-name "$STACK_NAME" \
             --region "$REGION" \
@@ -210,7 +221,9 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
+            --tags repo=ScreenWeave Project=ScreenWeave \
             --parameter-overrides \
+              "$ALERT_ARG" \
               "AuthMode=${{ steps.cipherweave.outputs.auth_mode }}" \
               "CipherWeaveJwks=${{ steps.cipherweave.outputs.jwks_b64 }}" \
               "CipherWeaveJwksUrl=${{ steps.cipherweave.outputs.jwks_url }}" \
