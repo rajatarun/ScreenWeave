@@ -27,7 +27,7 @@ There are two independent subsystems:
            ▼                                  ▼
 ┌─────────────────────────┐    ┌──────────────────────────────────────┐
 │  McpServerFunction      │    │  VisualQATriggerFunction             │
-│  Node.js 20 / 29s       │    │  Python 3.12 / 10s                   │
+│  Node.js 24 / 29s       │    │  Python 3.12 / 10s                   │
 │                         │    │                                      │
 │  Tools:                 │    │  • Validates session_id              │
 │  • crawl_url            │    │  • Forwards parent_session_id        │
@@ -102,7 +102,7 @@ There are two independent subsystems:
 
 ### McpServerFunction
 
-- Runtime: Node.js 20, 512 MB, 29s timeout (API Gateway limit)
+- Runtime: Node.js 24, 512 MB, 29s timeout (API Gateway limit)
 - Implements the full MCP JSON-RPC 2.0 protocol inline — no helper Lambdas
 - Handles: `initialize`, `ping`, `tools/list`, `tools/call`
 - On `crawl_url`: writes `RUNNING` to DynamoDB, calls `ec2:RunInstances` with a UserData script that downloads `crawl.py` from `CrawlerCodeBucket` and runs it

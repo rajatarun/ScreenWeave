@@ -324,7 +324,8 @@ export const handler = async (event) => {
       : (event.body || '{}');
     parsed = JSON.parse(raw);
   } catch (err) {
-    log('ERROR', 'Invalid JSON-RPC payload', { error: err.message });
+    // The caller's mistake, not ours: WARN, so it never pages anyone.
+    log('WARN', 'Invalid JSON-RPC payload', { error: err.message });
     return sseResponse(jsonRpcError(null, -32700, 'Parse error'));
   }
 
@@ -393,7 +394,12 @@ async function dispatchRpc(req) {
         return jsonRpcError(id, -32601, `Method not found: ${method}`);
     }
   } catch (err) {
-    log('ERROR', 'JSON-RPC dispatch failed', { method, error: err.message, stack: err.stack });
+    // ERROR lines raise the ops alarm. A tool rejecting its input throws a
+    // plain Error (bad url, missing session_id) -- any caller can produce
+    // those, so they are WARN. An AWS SDK failure (it carries $metadata) or a
+    // TypeError and friends is this service failing, and is ERROR.
+    const ours = Boolean(err?.$metadata) || !(err instanceof Error) || err.constructor !== Error;
+    log(ours ? 'ERROR' : 'WARN', 'JSON-RPC dispatch failed', { method, error: err?.message, stack: ours ? err?.stack : undefined });
     // Application errors become JSON-RPC errors so the client sees them
     return jsonRpcError(id, -32603, err.message);
   }
@@ -592,7 +598,7 @@ async function toolGetMetrics({ session_id }) {
   if (!statesUrl) throw new Error('states.json not available for this session');
 
   const res = await fetch(statesUrl);
-  if (!res.ok) throw new Error(`Failed to fetch states.json: HTTP ${res.status}`);
+  if (!res.ok) throw new ServiceError(`Failed to fetch states.json: HTTP ${res.status}`);
   const statesData = await res.json();
   const states     = statesData.states || [];
 
@@ -959,6 +965,9 @@ aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
+
+/** A failure of this service rather than of the caller's input: logged as ERROR. */
+class ServiceError extends Error {}
 
 /** Wrap data in an MCP tool result content envelope */
 function toolContent(data) {
