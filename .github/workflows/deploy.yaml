@@ -1,13 +1,13 @@
 name: Deploy ScreenWeave
 
+# Every push to main is tested and deployed (an unchanged stack is a no-op),
+# and every pull request is tested, audited and scanned but never deployed.
+# The old paths filter skipped the Visual QA Lambdas entirely.
 on:
   push:
     branches: [main]
-    paths:
-      - 'src/lambda/mcpServer/**'
-      - 'src/crawler/crawl.py'
-      - 'infra/main-stack.yaml'
-      - '.github/workflows/deploy.yaml'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # id-token: write  → request OIDC JWT exchanged for short-lived STS credentials
@@ -25,7 +25,91 @@ env:
   REGION: us-east-1
 
 jobs:
+  # The MCP server's node:test suite and the Python tests (crawler guard,
+  # Visual QA modules). Tests are a gate: deploy needs this job.
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/lambda/mcpServer/package-lock.json
+      - name: MCP server tests
+        working-directory: src/lambda/mcpServer
+        run: |
+          npm ci
+          npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python tests
+        run: |
+          python -m pip install pytest boto3 -r src/lambda/visualQAWorker/requirements.txt
+          python -m pytest -q tests
+
+  # Known-vulnerable dependencies block the deploy, like a red test. The
+  # Visual QA worker decodes screenshots of whatever site was crawled with
+  # Pillow, so its advisories are not theoretical.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: npm audit (MCP server, production dependencies)
+        working-directory: src/lambda/mcpServer
+        run: npm audit --omit=dev --audit-level=high
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: pip-audit (Visual QA Lambdas)
+        run: |
+          python -m pip install pip-audit
+          pip-audit -r src/lambda/visualQAWorker/requirements.txt --progress-spinner off
+          pip-audit -r src/lambda/visualQATrigger/requirements.txt --progress-spinner off
+
+  # Committed credentials block the deploy. gitleaks scans the full history,
+  # because a secret removed in a later commit is still published. The binary
+  # is a pinned release checked against its sha256.
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.28.0
+      GITLEAKS_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+      - name: gitleaks (full history)
+        run: |
+          "$RUNNER_TEMP/gitleaks" version
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
+
   deploy:
+    needs: [test, audit, secrets]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
@@ -46,7 +130,7 @@ jobs:
         with:
           node-version: '20'
           cache: npm
-          cache-dependency-path: src/lambda/mcpServer/package.json
+          cache-dependency-path: src/lambda/mcpServer/package-lock.json
 
       # sam build: runs npm install --production in src/lambda/mcpServer/,
       # copies built artifacts to .aws-sam/build/, resolves CodeUri paths.
