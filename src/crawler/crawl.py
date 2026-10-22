@@ -30,9 +30,11 @@ DynamoDB writes:
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import uuid
@@ -41,8 +43,45 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
+# ── Requests to this instance's own network are refused ──────────────────────
+# The Lambda refuses internal targets by name and literal address, but a
+# public hostname can resolve to one, a page can redirect to one, and any
+# subresource can point at one. Only here, after DNS, can that be checked.
+# The instance metadata service (169.254.169.254, fd00:ec2::254) is the one
+# that matters most: IMDSv2 is required, so a plain GET cannot read the role
+# credentials, but nothing on the instance's own network is a crawl target.
+
+def is_internal_address(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return not addr.is_global or addr.is_multicast
+
+
+def is_internal_host(host: str) -> bool:
+    """True when host is, or resolves to, any non-public address. Unresolvable
+    hosts are refused too: the request would fail anyway."""
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return True
+    return any(is_internal_address(info[4][0].split("%")[0]) for info in infos)
+
+
+async def guard_request(route) -> None:
+    url = route.request.url
+    parsed = urlparse(url)
+    if parsed.scheme in ("http", "https", "ws", "wss") and is_internal_host(parsed.hostname or ""):
+        log("WARN", "Blocked request to an internal address", url=url)
+        await route.abort("blockedbyclient")
+        return
+    await route.continue_()
+
+
 # ── Config from environment (set by startCrawl Lambda UserData) ───────────────
-BASE_URL    = sys.argv[1]
+BASE_URL    = sys.argv[1] if len(sys.argv) > 1 else ""
 OUT_DIR     = "/opt/output"
 SCREENS_DIR = f"{OUT_DIR}/screenshots"
 TRACE_PATH  = f"{OUT_DIR}/trace.zip"
@@ -464,6 +503,8 @@ async def main() -> None:
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 Chrome/122",
         )
+        # Every request the browser makes, redirects and subresources included.
+        await ctx.route("**/*", guard_request)
         await ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
         log("DEBUG", "Playwright tracing started", trace_path=TRACE_PATH)
         page = await ctx.new_page()

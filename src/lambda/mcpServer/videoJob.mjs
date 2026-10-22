@@ -13,14 +13,14 @@
  * invents an artifact URL, because a fabricated S3 link is indistinguishable
  * from a real one until someone tries to play it.
  */
+import { validateTargetUrl } from './crawlTarget.mjs';
+
 export const VIDEO_KIND = 'video';
 export const MIN_DURATION_S = 5;
 export const MAX_DURATION_S = 30;
 export const ALLOWED_SCALES = [1, 2, 3];
 export const DEFAULT_DURATION_S = 20;
 export const DEFAULT_SCALE = 3;
-
-const URL_RE = /^https?:\/\/[^\s]+$/i;
 
 /**
  * Normalise and check a generate_apple_video request.
@@ -36,8 +36,8 @@ export function validateVideoRequest({ url, session_id, duration_s, scale } = {}
     throw new Error('pass either url or session_id, not both');
   if (!hasUrl && !hasSession)
     throw new Error('one of url or session_id is required');
-  if (hasUrl && !URL_RE.test(url.trim()))
-    throw new Error('url must be a valid http(s) URL');
+  // The same target rules as crawl_url: a render captures the page too.
+  const targetUrl = hasUrl ? validateTargetUrl(url) : null;
 
   const duration = duration_s === undefined ? DEFAULT_DURATION_S : duration_s;
   if (!Number.isInteger(duration) || duration < MIN_DURATION_S || duration > MAX_DURATION_S)
@@ -48,7 +48,7 @@ export function validateVideoRequest({ url, session_id, duration_s, scale } = {}
     throw new Error(`scale must be one of ${ALLOWED_SCALES.join(', ')}`);
 
   return {
-    targetUrl: hasUrl ? url.trim() : null,
+    targetUrl,
     sourceSessionId: hasSession ? session_id.trim() : null,
     durationS: duration,
     scale: resolvedScale,
