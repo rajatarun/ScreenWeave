@@ -142,6 +142,62 @@ jobs:
       - name: Build
         run: sam build --template-file infra/main-stack.yaml
 
+      # CipherWeave tokens on /mcp are verified against this JWKS, taken here
+      # on the runner (public keys only). A missing CipherWeave stack is not
+      # fatal in audit mode -- /mcp then serves anonymous callers as before and
+      # refuses any token it is shown -- and is fatal in enforce mode, where it
+      # would refuse everyone. The mode is a repository variable (AUTH_MODE).
+      - name: Resolve the CipherWeave token issuer (JWKS for /mcp)
+        id: cipherweave
+        env:
+          AUTH_MODE: ${{ vars.AUTH_MODE || 'audit' }}
+          CIPHERWEAVE_STACK_NAME: ${{ vars.CIPHERWEAVE_STACK_NAME || 'cipherweave-prod' }}
+        run: |
+          get() {
+            aws cloudformation describe-stacks \
+              --stack-name "$CIPHERWEAVE_STACK_NAME" \
+              --region "$REGION" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text 2>/dev/null || echo ""
+          }
+          JWKS_URL=$(get IssuerJwksUrl)
+          ISSUER_ID=$(get IssuerId)
+          # The CLI prints the string None for an absent output.
+          if [ "$JWKS_URL" = "None" ]; then JWKS_URL=""; fi
+          if [ "$ISSUER_ID" = "None" ] || [ -z "$ISSUER_ID" ]; then ISSUER_ID="urn:cipherweave:prod"; fi
+          if [ "$AUTH_MODE" != audit ] && [ "$AUTH_MODE" != enforce ]; then
+            echo "::error::AUTH_MODE is '$AUTH_MODE'; use audit or enforce."
+            exit 1
+          fi
+          JWKS_B64=""
+          if [ -n "$JWKS_URL" ]; then
+            if JWKS_BODY=$(curl -sS --fail --max-time 15 "$JWKS_URL"); then
+              JWKS_MIN=$(printf '%s' "$JWKS_BODY" | jq -c '{keys: [.keys[]? | select(.kty == "EC" and .crv == "P-256" and (has("d") | not)) | {kid, kty, crv, x, y, use, alg}]}')
+              if [ "$(printf '%s' "$JWKS_MIN" | jq '.keys | length')" -gt 0 ]; then
+                JWKS_B64=$(printf '%s' "$JWKS_MIN" | base64 -w0)
+                echo "Deploy-time JWKS: $(printf '%s' "$JWKS_MIN" | jq -r '[.keys[].kid] | join(", ")')"
+              else
+                echo "::warning::$JWKS_URL has no ES256 key; /mcp will fetch the JWKS at runtime."
+              fi
+            else
+              echo "::warning::Could not download $JWKS_URL; /mcp will fetch the JWKS at runtime."
+            fi
+          elif [ "$AUTH_MODE" = enforce ]; then
+            echo "::error::AUTH_MODE is enforce and $CIPHERWEAVE_STACK_NAME has no IssuerJwksUrl: /mcp would refuse every caller."
+            exit 1
+          else
+            echo "::warning::No IssuerJwksUrl on $CIPHERWEAVE_STACK_NAME. /mcp serves anonymous callers and refuses any token."
+          fi
+          if [ "$AUTH_MODE" = audit ]; then
+            echo "::warning title=/mcp in audit mode::Requests without a token still run. Set the AUTH_MODE variable to enforce once TeamWeave sends tokens."
+          fi
+          {
+            echo "jwks_b64=$JWKS_B64"
+            echo "jwks_url=$JWKS_URL"
+            echo "issuer_id=$ISSUER_ID"
+            echo "auth_mode=$AUTH_MODE"
+          } >> "$GITHUB_OUTPUT"
+
       # sam deploy --resolve-s3: SAM creates and manages its own deployment
       # bucket automatically — no bucket parameters needed.
       # All S3 buckets (ArtifactsBucket, CrawlerCodeBucket) are created by CFN.
@@ -166,7 +222,12 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --tags repo=ScreenWeave Project=ScreenWeave \
-            --parameter-overrides "$ALERT_ARG"
+            --parameter-overrides \
+              "$ALERT_ARG" \
+              "AuthMode=${{ steps.cipherweave.outputs.auth_mode }}" \
+              "CipherWeaveJwks=${{ steps.cipherweave.outputs.jwks_b64 }}" \
+              "CipherWeaveJwksUrl=${{ steps.cipherweave.outputs.jwks_url }}" \
+              "CipherWeaveIssuer=${{ steps.cipherweave.outputs.issuer_id }}"
 
       # crawl.py is not packaged by SAM (it runs on EC2, not Lambda).
       # Upload it to the CrawlerCodeBucket created by CloudFormation.

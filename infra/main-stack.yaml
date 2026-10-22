@@ -60,6 +60,36 @@ Parameters:
       log). Empty: the topic and alarm exist, with no email subscription. Set
       with the repository variable ALERT_EMAIL.
 
+  AuthMode:
+    Type: String
+    Default: audit
+    AllowedValues: [audit, enforce]
+    Description: >
+      /mcp authentication (src/lambda/mcpServer/auth.mjs). audit: a request
+      without a token still runs and is logged as `mcp auth method=none`; a
+      presented token is verified and a bad one refused. enforce: every request
+      needs a CipherWeave token for audience screenweave, and each tool its
+      scope. Switch once no method=none lines appear (TeamWeave sends none yet).
+
+  CipherWeaveJwks:
+    Type: String
+    Default: ''
+    Description: >
+      The CipherWeave issuer's public JWKS, base64 JSON, taken on the deploy
+      runner so /mcp verifies with no network call. Public keys only.
+
+  CipherWeaveJwksUrl:
+    Type: String
+    Default: ''
+    Description: >
+      The issuer's JWKS URL. Fallback for a kid the deploy-time set lacks, and
+      the source of the authorization server named in the RFC 9728 metadata.
+
+  CipherWeaveIssuer:
+    Type: String
+    Default: urn:cipherweave:prod
+    Description: The iss claim CipherWeave tokens must carry.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conditions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,6 +458,10 @@ Resources:
           OBSERVATORY_METRICS_TABLE:    !Ref ObservatoryMetricsTableName
           CONTEXTWEAVE_RAW_BUCKET:      !Ref ContextWeaveRawBucketName
           MAX_CONCURRENT_CRAWLERS:      "3"
+          AUTH_MODE:                    !Ref AuthMode
+          CIPHERWEAVE_JWKS:             !Ref CipherWeaveJwks
+          CIPHERWEAVE_JWKS_URL:         !Ref CipherWeaveJwksUrl
+          CIPHERWEAVE_ISSUER:           !Ref CipherWeaveIssuer
       Events:
         PostMcp:
           Type: HttpApi
@@ -439,6 +473,13 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /mcp
+            Method: GET
+            ApiId: !Ref McpHttpApi
+        # RFC 9728: where a client learns which server mints tokens for /mcp.
+        ProtectedResourceMetadata:
+          Type: HttpApi
+          Properties:
+            Path: /.well-known/oauth-protected-resource
             Method: GET
             ApiId: !Ref McpHttpApi
       Tags:
@@ -574,6 +615,11 @@ Resources:
         AllowHeaders:
           - content-type
           - accept
+          - authorization
+          - dpop
+          - mcp-protocol-version
+        ExposeHeaders:
+          - www-authenticate
         MaxAge: 300
       DefaultRouteSettings:
         ThrottlingBurstLimit: 50

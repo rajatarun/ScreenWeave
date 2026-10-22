@@ -45,7 +45,8 @@ Paste the `McpClientConfig` stack output directly into your MCP client configura
 }
 ```
 
-No AWS credentials are required on the client side.
+No AWS credentials are required on the client side. A client authenticates
+with a CipherWeave access token instead — see [Authentication](#authentication).
 
 ### 3. Upload the crawler script
 
@@ -220,6 +221,34 @@ s3://<ArtifactsBucket>/
 ```
 
 ---
+
+## Authentication
+
+`/mcp` accepts CipherWeave access tokens: ES256 JWTs with `aud` = `screenweave`,
+verified in-process against the issuer's JWKS (`src/lambda/mcpServer/auth.mjs`,
+the same rules as `cipherweave_verify` in the other Weaves). A token bound to a
+key (`cnf.jkt`) must be sent as `Authorization: DPoP <token>` with a `DPoP`
+proof (RFC 9449); sent as `Bearer` it is refused.
+
+| Tool | Scope |
+|---|---|
+| `crawl_url`, `generate_apple_video`, `export_session` | `execute` |
+| `get_session_status`, `get_screenshots`, `get_metrics`, `get_full_session` | `read` |
+
+`AuthMode` (repository variable `AUTH_MODE`) decides what happens without a token:
+
+- **`audit`** (default): the request runs and is logged as `mcp auth` with
+  `method: none`. A token that *is* presented is verified, and a bad one is
+  refused with `401`. Scopes are logged, not enforced.
+- **`enforce`**: no token is `401`; a missing scope is `403` before any call in
+  the batch runs; `tools/list` shows only what the token can call.
+
+Audit is the default because TeamWeave calls `/mcp` with no token today (its
+`mcp_client` and its AgentCore gateway target). Switch to `enforce` once no
+`method: none` line appears in the MCP server's logs. Every `401` carries a
+`WWW-Authenticate` challenge pointing at
+`GET /.well-known/oauth-protected-resource` (RFC 9728), which names CipherWeave
+as the authorization server.
 
 ## Configuration
 
