@@ -15,7 +15,11 @@ From this repo:
 
 - Example crawl size: `total_states = 73` (requested example scenario).
 - Visual QA worker config: `MemorySize = 3008 MB` (2.9375 GB).
-- Worker model ID: `us.anthropic.claude-sonnet-4-20250514-v1:0`.
+- Worker model IDs, chosen per screen by complexity tier (`image_classifier.py`):
+  - Complex screens: `us.anthropic.claude-sonnet-4-20250514-v1:0` (Sonnet 4), at or above a complexity of 0.60.
+  - Routine screens: `us.anthropic.claude-haiku-4-5-20251001-v1:0` (Haiku 4.5), below 0.60.
+  - Simplest screens: no model call (tier `heuristic`), and screens whose interpretation is cached for 72 hours are not sent to a model at all.
+  - The figures below price every token at Sonnet 4, which is an upper bound for a run that uses Haiku for routine screens.
 
 From pricing pages (check again before production forecasting):
 
