@@ -7,7 +7,9 @@ ScreenWeave is deployed as a single AWS SAM/CloudFormation stack (`infra/main-st
 There are two independent subsystems:
 
 1. **Crawl Pipeline** — an MCP-compatible HTTP API that triggers an EC2 worker to crawl a site with Playwright and persist artifacts to S3.
-2. **Visual QA Pipeline** — a REST API that reads those artifacts, feeds them through Claude 3.5 Sonnet via Bedrock in a multi-turn conversation, and writes a structured QA report back to S3.
+2. **Visual QA Pipeline** — a REST API that reads those artifacts, classifies each screen by visual complexity, feeds the screens through Claude via Bedrock (Haiku 4.5 or Sonnet 4, or no model at all for the simplest screens) in a multi-turn conversation, and writes a structured QA report back to S3.
+
+The MCP server also exposes two tools beyond the crawl: `generate_apple_video` (renders a session as a video job) and `export_session` (copies a session into ContextWeave's raw ingestion prefix).
 
 ---
 
@@ -35,6 +37,8 @@ There are two independent subsystems:
 │  • get_screenshots      │    │  • Returns 202 immediately           │
 │  • get_metrics          │    └──────────────┬───────────────────────┘
 │  • get_full_session     │                   │ InvocationType=Event
+│  • generate_apple_video │
+│  • export_session       │
 └──────────┬──────────────┘                   ▼
            │ RunInstances               ┌──────────────────────────────┐
            │                           │  VisualQAWorkerFunction       │
@@ -76,8 +80,8 @@ There are two independent subsystems:
                                        │ InvokeModel
                            ┌───────────┴───────────────┐
                            │  Amazon Bedrock            │
-                           │  claude-3-5-sonnet         │
-                           │  -20241022-v2:0            │
+                           │  Haiku 4.5 (routine tier)  │
+                           │  Sonnet 4 (complex tier)   │
                            └───────────────────────────┘
 ```
 
@@ -103,10 +107,12 @@ There are two independent subsystems:
 ### McpServerFunction
 
 - Runtime: Node.js 24, 512 MB, 29s timeout (API Gateway limit)
-- Implements the full MCP JSON-RPC 2.0 protocol inline — no helper Lambdas
+- Implements the MCP JSON-RPC 2.0 protocol inline. `auth.mjs` checks the bearer token and each tool's scope before the tool runs. Denied calls are logged with the subject and tool name.
 - Handles: `initialize`, `ping`, `tools/list`, `tools/call`
+- Tools: `crawl_url`, `get_session_status`, `get_screenshots`, `get_metrics`, `get_full_session`, `generate_apple_video` (`videoJob.mjs`), `export_session` (`exportSession.mjs`)
 - On `crawl_url`: writes `RUNNING` to DynamoDB, calls `ec2:RunInstances` with a UserData script that downloads `crawl.py` from `CrawlerCodeBucket` and runs it
 - On `get_*` tools: reads from DynamoDB and/or S3, returns pre-signed URLs
+- `observatory.mjs` reports tool-call metrics to the shared observatory table
 - Reserved concurrency: 50
 
 ### VisualQATriggerFunction
@@ -122,6 +128,8 @@ There are two independent subsystems:
 - Runtime: Python 3.12, 3008 MB, 900s timeout
 - X-Ray tracing enabled
 - Always writes a result (report or error stub) to `{prefix}/{session_id}/qa_report.json`
+- **Tier routing** (`image_classifier.py`): each screen gets a complexity score in [0, 1] from local image measures. Below `HAIKU_THRESHOLD` it is assessed locally with no model call (tier `heuristic`). Below `SONNET_THRESHOLD` (0.60) it goes to Haiku 4.5 (`HAIKU_MODEL_ID`). At or above that it goes to Sonnet 4 (`SONNET_MODEL_ID`). A decode failure scores 0.5, so it lands on Haiku.
+- **Perceptual-hash cache** (`cache.py`, `ScreenweaveCacheTable`): an interpretation is keyed by the screen's 16-character dHash and kept for 72 hours. A recurring dashboard or UI state is answered from the cache, so it is not sent to a model again.
 
 #### Step 0 — Parent context (optional)
 If `parent_session_id` is present in the event:
@@ -176,6 +184,12 @@ The final user turn requests a raw JSON document (no markdown fences). The Worke
 - 90-day lifecycle expiry on all objects
 - `DeletionPolicy: Retain` (stack deletion does not delete data)
 
+### DynamoDB — ScreenweaveCacheTable (`<StackName>-phash-cache`)
+
+- Key: `phash` (16-character dHash of the screen image)
+- Stores Bedrock interpretation results. TTL of 72 hours.
+- On-demand billing. Read and written only by the Visual QA worker.
+
 ### S3 — CrawlerCodeBucket
 
 - Stores `crawler/crawl.py` — downloaded by EC2 workers at boot
@@ -198,7 +212,7 @@ The final user turn requests a raw JSON document (no markdown fences). The Worke
 | `McpServerRole` | Lambda | `dynamodb:{GetItem,PutItem}` on SessionsTable; `s3:{ListBucket,GetObject}` on ArtifactsBucket; `ec2:{RunInstances,CreateTags}`; `iam:PassRole` to CrawlerInstanceRole |
 | `CrawlerInstanceRole` | EC2 | `s3:PutObject` on ArtifactsBucket; `s3:GetObject` on CrawlerCodeBucket; `dynamodb:{PutItem,UpdateItem}` on SessionsTable; `ec2:TerminateInstances`; SSM managed instance core |
 | `VisualQATriggerRole` | Lambda | `lambda:InvokeFunction` on VisualQAWorkerFunction only |
-| `VisualQAWorkerRole` | Lambda | `s3:{ListBucket,GetObject,PutObject}` on ArtifactsBucket; `bedrock:InvokeModel` on `anthropic.claude-3-5-sonnet-20241022-v2:0` |
+| `VisualQAWorkerRole` | Lambda | `s3:{ListBucket,GetObject,PutObject}` on ArtifactsBucket; `dynamodb:{GetItem,PutItem}` on the phash cache table; `bedrock:InvokeModel` on the Haiku 4.5 and Sonnet 4 foundation models and their `us.` inference profiles |
 
 ---
 
@@ -258,6 +272,7 @@ Caller
 | `SessionsTableName` | DynamoDB session index table |
 | `VisualQAEndpoint` | Visual QA REST API — `POST {"session_id": "..."}` |
 | `VisualQAWorkerFunctionName` | Worker Lambda name (for log monitoring) |
+| `ScreenweaveCacheTableName` | perceptual-hash cache table |
 
 ---
 
