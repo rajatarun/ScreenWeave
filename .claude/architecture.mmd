@@ -1,34 +1,48 @@
 flowchart TB
-    subgraph POLICY["Policy layer — ScreenWeave: goal, allowed domains, forbidden actions, step/cost/time budgets, stop conditions"]
+    subgraph SESSION["QA session — run_id = crawl session_id"]
+        direction LR
+        MCP["MCP tools<br/>start_qa_run · continue_qa_run<br/>get_qa_run · rerun_qa"]
+        REC[("QARUN#run_id<br/>instruction · follow-ups · corrections<br/>environment · attempts")]
+        MCP --> REC
+    end
+
+    REC -- "attempt n<br/>(crawl first)" --> CLS{"Specific<br/>instruction?"}
+    CLS -- "yes" --> SPEC["Instruction is the plan<br/>1 case · source: user-instruction"]
+    CLS -- "no" --> GEN["Generate test cases<br/>URL · crawl graph · page content<br/>prior attempts · product description"]
+    SPEC --> SAVE[("Persist plan<br/>qa/attempt_n/plan.json")]
+    GEN --> SAVE
+
+    subgraph POLICY["Policy layer — allowed domains, forbidden actions, case/step/time caps, stop conditions"]
         direction TB
-        subgraph LOOP["Explore loop — observe → decide → act → observe"]
+        subgraph LOOP["Execute the plan — observe → act → observe, one planned step at a time"]
             direction LR
-            OBS["Observe<br/>screenshot + candidate elements<br/>(role, name, bbox)"]
-            DEC["Decide next action<br/>(policy-checked)"]
+            OBS["Observe<br/>screenshot + candidate elements"]
+            CHK["Policy check<br/>allow · deny · stop"]
             ACT["Act"]
-            OBS --> DEC --> ACT --> OBS
+            OBS --> CHK --> ACT --> OBS
         end
         subgraph RESOLVE["Element resolution — fallback order"]
             direction LR
-            SEL["1 · Deterministic Playwright<br/>selector / scripted flow"]
-            INT["2 · Intent locator<br/>vision-language model,<br/>confidence ≥ threshold"]
-            SAFE["3 · Fail safe<br/>no action, report"]
+            SEL["1 · Playwright selector"]
+            INT["2 · Intent locator<br/>confidence ≥ threshold"]
+            SAFE["3 · Fail safe<br/>no action"]
             SEL -- miss --> INT -- no confident match --> SAFE
         end
         ACT --> SEL
     end
 
-    LOOP -- "states,<br/>screenshots" --> ART[("Artifacts<br/>S3")]
+    SAVE -- "only after the saved plan reads back" --> LOOP
+    LOOP -- "findings" --> L1
 
     subgraph CHAIN["QA sign-off chain"]
         direction LR
-        L1["L1 · first-pass reviewer<br/>small model · every state<br/>→ structured findings"]
-        L2["L2 · senior-QA reviewer<br/>stronger model · escalations only<br/>confirm / dismiss / reclassify"]
-        L3["L3 · human sign-off<br/>flagged findings only<br/>only level that approves a release"]
-        L1 -- "escalate:<br/>severity, low confidence,<br/>category" --> L2
-        L2 -- "critical, unsure,<br/>downgraded critical,<br/>budget or error" --> L3
+        L1["L1 · first-pass reviewer<br/>cheap · every case / state"]
+        L2["L2 · senior-QA reviewer<br/>stronger model · escalations only"]
+        L3["L3 · human sign-off<br/>only level that approves"]
+        L1 -- "escalate" --> L2
+        L2 -- "critical, unsure,<br/>budget or error" --> L3
     end
 
-    ART --> L1
-    L3 --> REL{{"Release:<br/>approved · rejected ·<br/>needs-changes"}}
-    REL -. "recorded" .-> AUD[("qa_report.json + sign-off record<br/>append-only audit trail:<br/>who or what signed each level")]
+    L3 --> REL{{"Release:<br/>approved · rejected · needs-changes"}}
+    REL -. "recorded" .-> AUD[("results.json · signoff.json<br/>audit trail: who or what signed each level")]
+    AUD -. "context for continue / rerun" .-> REC

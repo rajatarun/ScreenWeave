@@ -1,6 +1,6 @@
 # ScreenWeave — Hybrid Architecture Proposal
 
-**Status:** proposal + first code slices (opt-in, not wired into production paths).
+**Status:** proposal + first code slices. The intent locator and sign-off chain are building blocks; the QA agent (§4) is wired into the crawl and MCP paths behind `QAAgentEnabled` (default off).
 **Anchor:** automate manual QA and run visual QA automatically, at a fraction of the usual cost.
 
 ScreenWeave today replays a fixed crawl and reviews the screenshots. This proposal turns it into a hybrid system that mirrors how a real QA organisation works: testers explore the product and capture issues, senior QA triages them, and a human signs off the release. Cheap automation does the bulk of the work; expensive judgement is spent only where it matters.
@@ -37,6 +37,7 @@ From the bottom up:
 | **Explore loop** | Treat the browser as an environment: observe → decide → act → observe. Each step produces a state for the artifact graph, so exploration feeds the same `states.json` / `transitions.json` contract. | Bounded by policy budgets |
 | **Policy layer** (ScreenWeave) | What to do, what to avoid, when to stop. Goals, allowed domains, forbidden actions, step / cost / time budgets, stop conditions. Checked before every action. | Free (deterministic rules) |
 | **QA sign-off chain** | L1 cheap AI reviewer → L2 senior AI reviewer → L3 human. Structured findings, escalation rules, per-tier budgets, audit trail. | Most work stops at L1 |
+| **QA agent sessions** (§4) | The conversation around a run: run ID = crawl session id, stored instruction / follow-ups / corrections, plan-first execution, rerun from stored context. | Talking is free; each attempt is one crawler instance |
 
 ### 2.1 Interfaces between layers
 
@@ -60,10 +61,13 @@ class Planner(Protocol):
     def next_action(self, goal, observation, history) -> Action: ...
 StepRecord(step, observation_ref, action, resolution, outcome, cost_usd)
 
-# Policy layer — proposed
-Policy(goal, allowed_domains, forbidden_actions, forbidden_text_patterns,
-       max_steps, max_cost_usd, max_seconds, stop_conditions)
-Policy.check(action, observation, spent) -> Allow | Deny(reason) | Stop(reason)
+# Policy layer — first slice shipped as QAPolicy (src/crawler/qa_agent.py)
+QAPolicy(allowed_domains, max_cases, max_steps_per_case, max_total_steps,
+         max_seconds, allowed_test_values)
+QAPolicy.check_plan(plan) -> notes            # trims to the caps
+QAPolicy.check_action(step, url, steps_done, elapsed) -> Decision(allow | deny | stop, reason)
+# Proposed generalisation for the explore loop
+Policy(goal, ..., forbidden_text_patterns, max_cost_usd, stop_conditions)
 ```
 
 ### 2.2 Fallback order for finding an element
@@ -219,7 +223,123 @@ Where the existing worker already saves money, the chain reuses it: the local he
 
 ---
 
-## 4. Evaluation plan
+## 4. QA agent: sessions, run IDs and plan-first runs
+
+The QA agent is the piece a person talks to: "test checkout with an expired card", "no, skip the newsletter", "run it again on a phone-sized screen". It keeps what was said, plans before it acts, and hands failures to the sign-off chain.
+
+### 4.1 Run IDs reuse the crawl session id
+
+There is no second id scheme. A QA run's `run_id` **is** the crawl `session_id`:
+
+- `start_qa_run(url=...)` starts a crawl exactly like `crawl_url`; that crawl's `session_id` becomes the `run_id`.
+- `start_qa_run(session_id=...)` attaches to an existing crawl session; its id becomes the `run_id`.
+
+So `get_session_status(run_id)` keeps working, and every artifact of the run sits under the session's existing S3 prefix.
+
+### 4.2 What the session stores, and where
+
+Existing storage only: the sessions table and the artifacts bucket.
+
+| Record | Written by | Holds |
+|---|---|---|
+| `SESSION#<run_id>` (sessions table) | MCP server / crawler, unchanged | Crawl status, stats |
+| `QARUN#<run_id>` (sessions table) | MCP server (`qaRun.mjs`) | Original instruction, product description, environment (URL, viewport), limits, classification hint, every follow-up / correction / rerun adjustment with timestamps, the list of attempts with their adjustments, a version number for optimistic locking |
+| `QARUN#<run_id>#ATTEMPT#<n>` (sessions table) | MCP server (REQUESTED / FAILED to launch), then the crawler (`qa_agent.py`) | Status: `REQUESTED → PLANNING → PLANNED → RUNNING → COMPLETED`, or `NEEDS_INPUT` / `FAILED`; mode, case count, summary, release state |
+| `<prefix>/<run_id>/qa/attempt_<nnn>/plan.json` (S3) | crawler | The generated test plan (persisted before anything runs) |
+| `.../results.json`, `.../signoff.json`, step screenshots | crawler | Per-case and per-step outcomes, the sign-off record and its audit trail |
+
+The two writers never write the same item: the MCP server owns the run record, the crawler owns attempt records and artifacts. Run-record writes are conditional on the version read (retried once on conflict), so two follow-ups sent at once are both kept. Limits: 50 messages of up to 2,000 characters, 20 attempts per run, one active attempt at a time (an attempt silent for an hour stops blocking). Run records expire after 30 days (TTL).
+
+Locally and in tests the same interfaces have in-memory fakes: `InMemoryQARunStore` (Python) and injected `deps` (Node).
+
+### 4.3 Specific instruction vs unspecified: the branching
+
+```
+request ─► classify (rule; optional model only if ambiguous)
+            ├─ specific ─────► the instruction IS the plan: one test case, source "user-instruction"
+            │                   (translated into steps; unparsable parts → needs-clarification, nothing runs)
+            └─ unspecified ──► generate test cases from URL, crawl graph, page content,
+                                prior attempts and product description (capped)
+                       ▼
+              policy.check_plan (case and step caps)  ─►  PERSIST plan  ─►  read back, compare digest
+                       ▼                                                     (mismatch → stop, run nothing)
+              execute step by step, policy.check_action before every step
+                       ▼
+              failed cases → findings → L1 → L2 → human (§3)
+```
+
+**Which request counts.** The agent looks at the newest specific instruction first: a rerun adjustment's `instruction`, then the user's messages newest to oldest, then the original instruction. Exclusion messages ("skip the newsletter", "don't test login") never become the instruction; they remove matching cases from generated plans. If nothing is specific, the run is unspecified and any ambiguous words ("pricing", "mobile") become focus terms that move matching generated cases to the front.
+
+**Plan-first rule.** When the request is unspecified the agent must generate test cases, save them, and only then act. The code enforces the order: `persist_plan` writes the plan and reads it back; a mismatch raises and no step runs. Tests assert that the plan-saved event comes before the first browser action, and that nothing runs when the store drops the plan. A specific instruction is persisted the same way before it runs.
+
+**No open-ended wandering.** Every plan is a finite list of steps. The policy trims plans to `max_cases` (default 8, max 20), steps per case (12) and `max_steps` in total (default 60, max 200), stops on the step or time budget, and denies navigation off the target's domain, destructive clicks (delete, place order, pay, unsubscribe...), and typing into credential or payment fields unless the operator allow-lists a test value.
+
+### 4.4 The classification rule
+
+Deterministic, shared by Python (`qa_agent.classify_request`, authoritative at planning time) and Node (`qaRun.classifyRequest`, the hint `start_qa_run` and `continue_qa_run` return). The word lists and 14 test cases live in `contracts/qa_request_classification.json`; both test suites check their lists equal the contract and every case classifies the same.
+
+1. Empty request → **unspecified** (`empty`).
+2. Lowercase; note any `"double-quoted"`, curly-quoted or `` `backticked` `` phrase; remove URLs and quoted phrases.
+3. Split into words; drop generic words (`qa`, `test`, `site`, `app`, `the`, `bugs`, `please`, ...).
+4. Nothing left and no quote → **unspecified** (`generic`): "QA this site", "test the whole app for bugs".
+5. A quote → **specific** (`quoted`). A leftover action verb (`click`, `checkout`, `log`, `fill`, `submit`, ...) → **specific** (`action-verb`). A test verb (`test`, `check`, `verify`, ...) plus any leftover word → **specific** (`test-verb-object`): "verify the footer links".
+6. Otherwise → **unspecified, ambiguous** with the leftover words as focus: "the pricing table looks off on mobile".
+
+An optional model classifier (`RequestClassifier`, Bedrock adapter included) is consulted **only** for step 6 and only trusted at confidence ≥ 0.7. Clear cases never cost a model call.
+
+### 4.5 Test-case generation
+
+`TestCaseGenerator.generate(context, max_cases) -> [TestCase]`, with `TestCase = {id, title, steps[{action, intent, selector, value}], expected, priority P0–P2, source, status, notes}`. Allowed step actions: `navigate`, `click`, `fill`, `assert_text`, `assert_visible`, `assert_url`, `assert_no_error`. Sources: `user-instruction`, `url`, `crawl-graph`, `page-content`, `prior-session`, `product-description`, `model`.
+
+- `HeuristicTestCaseGenerator` (default, deterministic, free): re-tests of the previous attempt's failures (P0, `prior-session`); flows the product description names that the crawl actually saw (P0, `product-description`); page-loads-with-heading per crawled page (P1, `page-content` / `url`); each crawled control responds (P2, `crawl-graph`).
+- `BedrockTestCaseGenerator`: the same context summarised as JSON to a small model; output validated (unknown actions dropped, unknown sources become `model`, caps enforced).
+- Specific requests go through `InstructionTranslator`: `RuleInstructionTranslator` (deterministic: open/click/fill/verify/expect/test clauses) or `BedrockInstructionTranslator`. A part neither can turn into a step (e.g. "with an expired card" without test data) marks the case `needs-clarification`; the attempt ends `NEEDS_INPUT` with the plan saved and nothing executed, and the user answers with `continue_qa_run`.
+
+In the shipped wiring the crawler uses the deterministic generator and translator. The Bedrock adapters exist and are tested against stubs; enabling them on the crawler needs a Bedrock permission that this change does not add (§4.8).
+
+### 4.6 Continue and rerun use the stored context
+
+- `continue_qa_run(run_id, message, kind?)` appends a follow-up or correction (kind inferred from "no", "actually", "skip", ... when omitted) and returns what it will change. Talking never launches anything.
+- `rerun_qa(run_id, adjustments?)` adds attempt *n+1* to the same run. The agent then:
+  - **redoes the stored plan exactly** when nothing new was said since that plan and no `instruction` / `replan` is given (`case_ids` limits it to those cases);
+  - **re-plans** (classify → plan → persist → run) when messages arrived after the last plan, or with `instruction` / `replan: true`.
+  - `viewport`, `max_cases` and `max_steps` override the run's settings for that attempt.
+- Every attempt re-crawls first (fresh state graph for planning). The crawl artifacts at the session root show the latest attempt; each attempt's QA artifacts stay under `qa/attempt_<nnn>/`.
+
+### 4.7 MCP tools
+
+Listed and callable only when `QA_AGENT_ENABLED=true`; same JSON-RPC envelope, error style and scope table as the existing tools.
+
+| Tool | Scope | Does |
+|---|---|---|
+| `start_qa_run(url \| session_id, instruction?, product_description?, viewport?, max_cases?, max_steps?)` | execute | Creates the run (run_id = crawl session id), launches attempt 1, returns `run_id`, the classification hint and what the agent will do next |
+| `continue_qa_run(run_id, message, kind?)` | execute | Appends to the session |
+| `get_qa_run(run_id)` | read | Instruction, messages, environment, limits, last 10 attempts, and the latest plan, results, findings and sign-off state |
+| `rerun_qa(run_id, adjustments?)` | execute | Adds and launches the next attempt |
+
+### 4.8 Infrastructure changes (`infra/main-stack.yaml`)
+
+| Change | Default effect on deploy |
+|---|---|
+| New parameter `QAAgentEnabled` (`'false'` / `'true'`, default `'false'`) and condition `QAAgentOn` | Parameter added; nothing else |
+| `McpServerFunction` env `QA_AGENT_ENABLED: !Ref QAAgentEnabled` | Function configuration updated with `QA_AGENT_ENABLED=false`; tools stay hidden and refused |
+| `CrawlerInstanceRole` inline policy `QAAgentRunAccess` under `!If QAAgentOn`: `dynamodb:GetItem` on the sessions table; `s3:GetObject` on `screenweave/*/qa/*` in the artifacts bucket | Not created while the parameter is `false`. No IAM change by default |
+
+No new table, bucket or function. The MCP role already has `GetItem` / `PutItem` on the sessions table and `GetObject` on the artifacts bucket, which is all the tools need. The crawler already has `PutItem` on the table and `PutObject` on the bucket for plans and results.
+
+To turn it on, two more things are needed beyond `QAAgentEnabled=true`:
+
+1. Upload `src/crawler/intent_locator.py`, `src/crawler/qa_agent.py` and `src/lambda/visualQAWorker/signoff_chain.py` to `s3://<CrawlerCodeBucket>/crawler/`, next to `crawl.py`. The deploy workflow uploads only `crawl.py` today. Without them a QA attempt still crawls, then records `FAILED: QA agent modules missing`.
+2. For model-backed planning or intent locating on the crawler, `bedrock:InvokeModel` on the chosen model for `CrawlerInstanceRole`. Not included here.
+
+### 4.9 How it feeds the rest
+
+- **Intent locator:** every click, fill or visibility check resolves selector first, then by intent when the locator is enabled; resolution failures become step failures with a screenshot.
+- **Policy layer:** `QAPolicy` is the first concrete slice of §2's policy layer: plan caps, per-action allow / deny / stop, budgets.
+- **Sign-off chain:** each failed case becomes a finding (P0 → critical, P1 → major, P2 → minor; category `functional`, so it always reaches L2) with the failing step's region, all steps as repro steps and screenshots as evidence. L1 is a deterministic execution reviewer (no model). Until an L2 reviewer is configured its budget is zero, so every escalation lands in the human queue, never approved.
+- **Explore loop:** not built yet. Planned runs are the bounded first step toward it: the agent explores only through cases it wrote down first.
+
+## 5. Evaluation plan
 
 All offline first; no live sites in CI.
 
@@ -229,18 +349,18 @@ All offline first; no live sites in CI.
 4. **Explore loop goals.** Small local apps with goals ("reach the confirmation page"). Metrics: goal completion, steps used vs budget, policy denials, zero forbidden actions executed.
 5. **Regression gate.** Any change to prompts, thresholds or models replays 1–3 on a saved set and must not regress wrong-click rate or critical-finding recall.
 
-## 5. Phased roadmap
+## 6. Phased roadmap
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0 (this PR)** | Proposal; intent locator module with Bedrock adapter and fake; sign-off chain data model and L1→L2→human escalation with fake reviewers; fixtures and tests. All opt-in, nothing wired in. | Tests pass offline; no behaviour change in crawl or Visual QA. |
-| **1 — Sign-off chain in Visual QA** | L1/L2 reviewers on Bedrock behind the protocols (reuse worker batching, routing, cache). Write the sign-off record and audit trail next to `qa_report.json`. Read-only MCP tool to fetch a run's sign-off state; human sign-off recorded by a named person through an explicit call. Feature flag, default off. | Replay suite (§4.3) meets targets; cost per run measured and documented. |
+| **0 (this PR)** | Proposal; intent locator module with Bedrock adapter and fake; sign-off chain data model and L1→L2→human escalation; QA agent sessions (run ID = crawl session id), specific-vs-planned branching with plan-first execution, `QAPolicy`, four MCP tools; crawler hook. All behind `QAAgentEnabled` (default off). | Tests pass offline; with the flag off, `crawl_url`'s boot script, the tool list and IAM are unchanged. |
+| **1 — Sign-off chain in Visual QA** | Upload the QA modules with `crawl.py` in the deploy workflow; an L2 reviewer for QA findings; a human sign-off call; L1/L2 visual reviewers on Bedrock behind the protocols (reuse worker batching, routing, cache). Write the sign-off record and audit trail next to `qa_report.json`. Read-only MCP tool to fetch a run's sign-off state; human sign-off recorded by a named person through an explicit call. Feature flag, default off. | Replay suite (§5.3) meets targets; cost per run measured and documented. |
 | **2 — Intent locator in the crawler** | Behind `SCREENWEAVE_INTENT_LOCATOR`, `click_interactive` resolves through `resolve_stable` with intents derived from labels; resolution logs added to `states.json`. | Locator suite: zero wrong clicks; measurable recovery on v2 fixtures. |
 | **3 — Policy layer** | `Policy` object and `check()` before every action, defaults for domain allowlist, credential-field ban, destructive-intent denylist, step/cost/time caps; policy passed through `crawl_url`. | Every action in a run has a recorded policy decision; budget stops are clean. |
-| **4 — Explore loop** | Planner protocol, observe/decide/act loop driven by goals within the policy; steps become states and repro steps. | Goal suite (§4.4) completion with zero forbidden actions. |
+| **4 — Explore loop** | Planner protocol, observe/decide/act loop driven by goals within the policy; steps become states and repro steps. | Goal suite (§5.4) completion with zero forbidden actions. |
 | **5 — Hardening** | Cost dashboards per tier, threshold tuning, more fixture pairs, flaky-site handling, human review UI. | Documented costs from real runs replace the example model. |
 
-## 6. Open questions
+## 7. Open questions
 
 - Where the human sign-off is recorded (MCP tool, a REST endpoint, or a pull-request check) and how the reviewer identity is verified.
 - Whether L1 should see full-page screenshots or viewport crops around candidate regions (cost vs recall).

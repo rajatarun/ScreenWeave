@@ -1,0 +1,40 @@
+{
+  "description": "Deterministic rule that decides whether a QA request is a specific instruction (run it as the plan) or unspecified (generate a test plan first). Implemented twice: src/crawler/qa_agent.py (authoritative, used when planning) and src/lambda/mcpServer/qaRun.mjs (hint returned by start_qa_run / continue_qa_run). Both load the word lists from this file and both test suites run every case below. Change the rule here, in both implementations, and in .claude/architecture.md together.",
+  "rule": [
+    "1. Empty or whitespace-only request -> unspecified (rule: empty).",
+    "2. Lowercase. Note whether a double-quoted, curly-quoted or backticked phrase of 2+ characters is present, then remove URLs and quoted phrases.",
+    "3. Words are matches of [a-z0-9]+('[a-z]+)? ; leftover = words not in generic_words.",
+    "4. No leftover and no quote -> unspecified (rule: generic).",
+    "5. A quote -> specific (rule: quoted). Else a leftover word in action_verbs -> specific (rule: action-verb). Else a word in test_verbs plus any leftover -> specific (rule: test-verb-object).",
+    "6. Otherwise -> unspecified with ambiguous=true and focus=leftover (rule: ambiguous). An optional model classifier may overrule only this case."
+  ],
+  "generic_words": [
+    "a", "about", "all", "an", "and", "app", "application", "around", "at", "audit", "basic", "bug", "bugs",
+    "can", "check", "could", "do", "entire", "everything", "explore", "find", "for", "full", "general", "go",
+    "i", "issues", "it", "look", "me", "my", "of", "on", "our", "page", "pages", "please", "problems", "product",
+    "qa", "quick", "regressions", "review", "run", "site", "smoke", "some", "test", "testing", "tests", "the",
+    "this", "through", "to", "ui", "url", "us", "website", "whole", "would", "you"
+  ],
+  "test_verbs": ["check", "test", "try", "verify", "validate", "confirm", "ensure"],
+  "action_verbs": [
+    "add", "buy", "cancel", "checkout", "choose", "click", "download", "enter", "fill", "log", "login", "logout",
+    "navigate", "open", "pay", "press", "register", "remove", "search", "select", "sign", "signup", "submit",
+    "tap", "type", "upload"
+  ],
+  "cases": [
+    {"text": "", "kind": "unspecified", "rule": "empty"},
+    {"text": "   ", "kind": "unspecified", "rule": "empty"},
+    {"text": "QA this site", "kind": "unspecified", "rule": "generic"},
+    {"text": "Please test the whole app for bugs", "kind": "unspecified", "rule": "generic"},
+    {"text": "run a quick smoke test on https://shop.example.com", "kind": "unspecified", "rule": "generic"},
+    {"text": "can you look around and find issues?", "kind": "unspecified", "rule": "generic"},
+    {"text": "test checkout with an expired card", "kind": "specific", "rule": "action-verb"},
+    {"text": "Click Checkout, then verify \"Order placed\"", "kind": "specific", "rule": "quoted"},
+    {"text": "make sure `Add to cart` works", "kind": "specific", "rule": "quoted"},
+    {"text": "log in and open settings", "kind": "specific", "rule": "action-verb"},
+    {"text": "check the mobile layout of the pricing page", "kind": "specific", "rule": "test-verb-object"},
+    {"text": "verify the footer links", "kind": "specific", "rule": "test-verb-object"},
+    {"text": "the pricing table looks off on mobile", "kind": "unspecified", "rule": "ambiguous"},
+    {"text": "focus on accessibility", "kind": "unspecified", "rule": "ambiguous"}
+  ]
+}

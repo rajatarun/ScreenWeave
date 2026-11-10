@@ -22,6 +22,8 @@
  *   get_metrics           – DynamoDB + states.json fetch + computed metrics
  *   get_full_session      – DynamoDB + S3 list + pre-signed URLs (full bundle)
  *   export_session        – copy text/metadata artifacts to ContextWeave's raw/ prefix
+ *   start_qa_run, continue_qa_run, get_qa_run, rerun_qa
+ *                         – QA agent sessions (qaRun.mjs); only when QA_AGENT_ENABLED=true
  *
  * Every tool call is wrapped by observatory.mjs, which records an invocation
  * span (tool name, args hash, duration, outcome) to the shared
@@ -42,6 +44,7 @@
  *   SIGNED_URL_EXPIRES_SECONDS   Pre-signed URL TTL (default: 3600)
  *   OBSERVATORY_METRICS_TABLE    Shared cross-project telemetry table (optional)
  *   CONTEXTWEAVE_RAW_BUCKET      ContextWeave raw ingestion bucket for export_session (optional)
+ *   QA_AGENT_ENABLED             "true" enables the QA agent tools (default off)
  */
 
 import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
@@ -54,6 +57,10 @@ import { validateVideoRequest, startVideoJob } from './videoJob.mjs';
 import { withObservability } from './observatory.mjs';
 import { uploadSessionExport } from './exportSession.mjs';
 import { boundedInt, shellSafeB64, validateTargetUrl } from './crawlTarget.mjs';
+import {
+  QA_TOOL_DEFINITIONS, RUN_ID_REGEX, continueQaRun, getQaRun, qaAgentEnabled,
+  rerunQa, startQaRun,
+} from './qaRun.mjs';
 import {
   WELL_KNOWN_PATH, authenticate, protectedResourceMetadata, requestUrl, requiredScope,
   toolAllowed, wwwAuthenticate,
@@ -421,13 +428,16 @@ async function dispatchRpc(req, auth = { principal: null, mode: 'audit' }) {
       case 'ping':
         return jsonRpcOk(id, {});
 
-      case 'tools/list':
-        // Under enforce a token sees only what it can call.
+      case 'tools/list': {
+        // Under enforce a token sees only what it can call. The QA agent tools
+        // are listed only when QA_AGENT_ENABLED is true.
+        const catalogue = qaAgentEnabled() ? [...TOOL_DEFINITIONS, ...QA_TOOL_DEFINITIONS] : TOOL_DEFINITIONS;
         return jsonRpcOk(id, {
           tools: auth.mode === 'enforce' && auth.principal
-            ? TOOL_DEFINITIONS.filter((t) => toolAllowed(auth.principal, t.name))
-            : TOOL_DEFINITIONS,
+            ? catalogue.filter((t) => toolAllowed(auth.principal, t.name))
+            : catalogue,
         });
+      }
 
       case 'tools/call': {
         if (!params?.name) return jsonRpcError(id, -32602, 'Missing tool name in params');
@@ -470,8 +480,58 @@ async function dispatchTool(name, args) {
     case 'get_full_session':   return toolGetFullSession(args);
     case 'export_session':     return toolExportSession(args);
     case 'generate_apple_video': return toolGenerateAppleVideo(args);
+    case 'start_qa_run':
+    case 'continue_qa_run':
+    case 'get_qa_run':
+    case 'rerun_qa':           return toolQa(name, args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+// ── Tools: QA agent sessions (qaRun.mjs) ─────────────────────────────────────
+const QA_HANDLERS = { start_qa_run: startQaRun, continue_qa_run: continueQaRun, get_qa_run: getQaRun, rerun_qa: rerunQa };
+
+async function toolQa(name, args) {
+  if (!qaAgentEnabled()) throw new Error(`${name} is not enabled (QA_AGENT_ENABLED is not true)`);
+  return toolContent(await QA_HANDLERS[name](args, qaDeps()));
+}
+
+/** AWS access for qaRun.mjs: the sessions table, the artifacts bucket, the crawler launch. */
+export function qaDeps() {
+  return {
+    prefix: BUCKET_PREFIX,
+    now: () => new Date().toISOString(),
+    newId: () => randomUUID(),
+    assertCapacity: () => assertCrawlerCapacity(),
+    fetchSession: (sessionId) => fetchSession(sessionId),
+    getItem: async (pk) => {
+      const res = await dynamo.send(new GetItemCommand({ TableName: TABLE_NAME, Key: { session_id: { S: pk } } }));
+      return res.Item ? unmarshall(res.Item) : null;
+    },
+    putItem: (item, { mustNotExist = false, expectVersion } = {}) => dynamo.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(item, { removeUndefinedValues: true }),
+      ...(mustNotExist ? { ConditionExpression: 'attribute_not_exists(session_id)' } : {}),
+      ...(expectVersion !== undefined ? {
+        ConditionExpression: '#v = :v',
+        ExpressionAttributeNames: { '#v': 'version' },
+        ExpressionAttributeValues: marshall({ ':v': expectVersion }),
+      } : {}),
+    })),
+    getJson: async (key) => {
+      const text = await getS3Text(key);
+      return text ? JSON.parse(text) : null;
+    },
+    launchAttempt: async ({ runId, attempt, targetUrl, viewport, maxDepth, maxLinks, newSession }) => {
+      boundedInt(maxDepth, 'max_depth', 0, MAX_DEPTH_LIMIT);
+      boundedInt(maxLinks, 'max_links', 1, MAX_LINKS_LIMIT);
+      if (newSession) await putRunningSession(runId, targetUrl, maxDepth, maxLinks);
+      const instanceId = await runCrawlerInstance({ sessionId: runId, targetUrl, maxDepth, maxLinks,
+        qa: { runId, attempt, viewport } });
+      log('INFO', 'QA attempt launched', { run_id: runId, attempt, instance_id: instanceId });
+      return { instance_id: instanceId };
+    },
+  };
 }
 
 // ── Tool: crawl_url ───────────────────────────────────────────────────────────
@@ -486,7 +546,22 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
   const ttl       = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7-day TTL
   log('INFO', 'Validated crawl_url input', { session_id: sessionId, target_url: targetUrl, max_depth, max_links });
 
-  // Write RUNNING record to DynamoDB
+  await putRunningSession(sessionId, targetUrl, max_depth, max_links, now, ttl);
+  const instanceId = await runCrawlerInstance({ sessionId, targetUrl, maxDepth: max_depth, maxLinks: max_links });
+  log('INFO', 'Crawl started', { session_id: sessionId, instance_id: instanceId });
+
+  return toolContent({
+    session_id:  sessionId,
+    status:      'RUNNING',
+    target_url:  targetUrl,
+    instance_id: instanceId,
+    message:     `Crawl started. Poll get_session_status(session_id="${sessionId}") until COMPLETED.`,
+  });
+}
+
+// Write the RUNNING crawl row (crawl_url, and start_qa_run for a new session).
+async function putRunningSession(sessionId, targetUrl, max_depth, max_links,
+  now = new Date().toISOString(), ttl = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60) {
   log('INFO', 'Writing RUNNING session to DynamoDB', { session_id: sessionId, table_name: TABLE_NAME });
   await dynamo.send(new PutItemCommand({
     TableName: TABLE_NAME,
@@ -502,11 +577,13 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
     }),
     ConditionExpression: 'attribute_not_exists(session_id)',
   }));
+}
 
-  // Launch EC2 crawler
+// Launch one self-terminating crawler instance. qa (optional) makes it a QA attempt.
+async function runCrawlerInstance({ sessionId, targetUrl, maxDepth, maxLinks, qa }) {
   log('INFO', 'Building EC2 user-data and launching crawler instance', { session_id: sessionId, ami_id: AMI_ID, instance_type: INSTANCE_TYPE });
   const userDataBase64 = Buffer.from(
-    buildUserData({ sessionId, targetUrl, region: REGION, table: TABLE_NAME, maxDepth: max_depth, maxLinks: max_links })
+    buildUserData({ sessionId, targetUrl, region: REGION, table: TABLE_NAME, maxDepth, maxLinks, qa })
   ).toString('base64');
 
   const ec2Result = await ec2.send(new RunInstancesCommand({
@@ -531,16 +608,7 @@ async function toolCrawlUrl({ url, max_depth = 2, max_links = 12 }) {
     }],
   }));
 
-  const instanceId = ec2Result.Instances[0].InstanceId;
-  log('INFO', 'Crawl started', { session_id: sessionId, instance_id: instanceId });
-
-  return toolContent({
-    session_id:  sessionId,
-    status:      'RUNNING',
-    target_url:  targetUrl,
-    instance_id: instanceId,
-    message:     `Crawl started. Poll get_session_status(session_id="${sessionId}") until COMPLETED.`,
-  });
+  return ec2Result.Instances[0].InstanceId;
 }
 
 // ── Tool: generate_apple_video ────────────────────────────────────────────────
@@ -930,7 +998,8 @@ async function assertCrawlerCapacity() {
  * target URL is passed base64-encoded inside single quotes and decoded on the
  * instance, and the depth and link limits are validated integers.
  */
-export function buildUserData({ sessionId, targetUrl, region, table, maxDepth, maxLinks }) {
+export function buildUserData({ sessionId, targetUrl, region, table, maxDepth, maxLinks, qa }) {
+  const q = qaUserData(qa);
   return `#!/bin/bash
 set -euxo pipefail
 exec > /var/log/screenweave-crawler.log 2>&1
@@ -974,7 +1043,7 @@ python3 -m playwright install chromium
 # ── 3. Download crawler script ─────────────────────────────────────────────────
 aws s3 cp "s3://${CODE_BUCKET}/crawler/crawl.py" /opt/crawl.py --region "$REGION"
 echo "Crawler: $(wc -l /opt/crawl.py | awk '{print $1}') lines"
-
+${q.download}
 # ── 4. Run crawler ─────────────────────────────────────────────────────────────
 export SCREENWEAVE_SESSION_ID="$SESSION_ID"
 export SCREENWEAVE_MAX_DEPTH="$MAX_DEPTH"
@@ -984,7 +1053,7 @@ export SCREENWEAVE_S3_BUCKET="$S3_BUCKET"
 export SCREENWEAVE_S3_PREFIX="$S3_PREFIX"
 export SCREENWEAVE_REGION="$REGION"
 export SCREENWEAVE_LOG_LEVEL="$LOG_LEVEL"
-
+${q.env}
 python3 /opt/crawl.py "$TARGET_URL" || {
   aws dynamodb update-item \\
     --table-name "$DYNAMO_TABLE" \\
@@ -1004,12 +1073,41 @@ aws s3 cp "$OUT_DIR/transitions.json" "$SESSION_S3/transitions.json" --region "$
 aws s3 cp "$OUT_DIR/trace.zip"        "$SESSION_S3/trace.zip"        --region "$REGION"
 aws s3 sync "$OUT_DIR/screenshots/"   "$SESSION_S3/screenshots/"     --region "$REGION"
 aws s3 cp /var/log/screenweave-crawler.log "$SESSION_S3/crawler.log" --region "$REGION"
-
+${q.upload}
 echo "Uploaded $(ls $OUT_DIR/screenshots/*.png 2>/dev/null | wc -l) screenshots to $SESSION_S3"
 
 # ── 6. Self-terminate ──────────────────────────────────────────────────────────
 aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
 `;
+}
+
+/**
+ * Extra boot-script lines for a QA attempt; all empty for a plain crawl, so
+ * crawl_url's script is unchanged. Every value is validated: run id against
+ * the session-id pattern, attempt and viewport as bounded integers.
+ */
+function qaUserData(qa) {
+  if (!qa) return { download: '', env: '', upload: '' };
+  if (!RUN_ID_REGEX.test(qa.runId)) throw new Error('Invalid run_id');
+  if (!Number.isInteger(qa.attempt) || qa.attempt < 1 || qa.attempt > 99) throw new Error('Invalid attempt');
+  const vp = qa.viewport && Number.isInteger(qa.viewport.width) && Number.isInteger(qa.viewport.height)
+    ? `${qa.viewport.width}x${qa.viewport.height}` : '';
+  return {
+    download: `
+# ── 3b. QA agent modules (QA attempts only) ────────────────────────────────────
+for f in intent_locator.py qa_agent.py signoff_chain.py; do
+  aws s3 cp "s3://${CODE_BUCKET}/crawler/$f" "/opt/$f" --region "$REGION" || echo "missing crawler/$f"
+done
+`,
+    env: `export SCREENWEAVE_QA_RUN_ID="${qa.runId}"
+export SCREENWEAVE_QA_ATTEMPT="${qa.attempt}"
+export SCREENWEAVE_QA_VIEWPORT="${vp}"
+`,
+    upload: `if [ -d "$OUT_DIR/qa" ]; then
+  aws s3 sync "$OUT_DIR/qa/" "$SESSION_S3/qa/" --region "$REGION" || true
+fi
+`,
+  };
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────

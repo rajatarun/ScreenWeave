@@ -74,3 +74,12 @@ decision** and is deliberately **not** changed here. The test asserts the curren
 behaviour so the gap is a checked fact rather than folklore: if the `pk` is ever
 fixed, or a reader is taught to enumerate tool names, the test fails and forces
 the change to be acknowledged.
+
+## `qa_request_classification.json`
+
+**Canonical home: this repository.** The rule that decides whether a QA request
+is a specific instruction (run it as the plan) or unspecified (generate a test
+plan first). Implemented in `src/crawler/qa_agent.py` and
+`src/lambda/mcpServer/qaRun.mjs`; both test suites check their word lists equal
+this file and that every case in it classifies the same. Change all three
+together. See `.claude/architecture.md`, "The classification rule".
