@@ -143,6 +143,10 @@ jobs:
           cache: npm
           cache-dependency-path: src/lambda/mcpServer/package-lock.json
 
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
       # sam build: runs npm install --production in src/lambda/mcpServer/,
       # copies built artifacts to .aws-sam/build/, resolves CodeUri paths.
       - name: SAM build
