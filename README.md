@@ -155,46 +155,84 @@ Before exposing the endpoint publicly, use `enforce` and restrict network access
 
 ## Configuration (optional)
 
-| Env / parameter | Purpose |
-|-----------------|--------|
-| `OBSERVATORY_METRICS_TABLE` | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
-| `CONTEXTWEAVE_RAW_BUCKET` | Enables `export_session` |
-| `AuthMode` | `audit` or `enforce` |
-| CipherWeave JWKS parameters | Token verification keys |
+Beyond defaults in `infra/main-stack.yaml`, optional integration and auth settings apply only when set:
 
-Example deploy overrides (use **your** table/bucket names and ARNs):
+| Env var | SAM parameter | Default | Description |
+|---|---|---|---|
+| `OBSERVATORY_METRICS_TABLE` | `ObservatoryMetricsTableName` | *(blank)* | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
+| `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | Enables `export_session` to a ContextWeave raw-ingestion bucket |
+| `AUTH_MODE` | `AuthMode` | `audit` | `audit` or `enforce` for `/mcp` |
+| CipherWeave JWKS | `CipherWeaveJwks*` parameters | *(blank)* | Token verification keys when using an external issuer |
+
+Set `ObservatoryMetricsTableArn` alongside `ObservatoryMetricsTableName` so IAM grants `dynamodb:PutItem` on that table only when the name is non-blank.
+
+**Local `sam deploy`** (placeholders only — use your account's names and ARNs):
 
 ```bash
 sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-    ObservatoryMetricsTableName=<metrics-table-name> \
-    ObservatoryMetricsTableArn=<metrics-table-arn> \
-    ContextWeaveRawBucketName=<contextweave-raw-bucket>
+    ObservatoryMetricsTableName=<shared-observatory-metrics-table> \
+    ObservatoryMetricsTableArn=arn:aws:dynamodb:<region>:123456789012:table/<shared-observatory-metrics-table> \
+    ContextWeaveRawBucketName=<contextweave-raw-ingestion-bucket>
 ```
+
+For **GitHub Actions**, set repository variables and secrets per [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md) instead of embedding account-specific values in the repo. The deploy job validates required settings before `sam deploy`.
+
+---
+
+## CI/CD
+
+Pushes to `main` that touch `src/`, `infra/main-stack.yaml`, or the workflow file trigger an automatic deploy via GitHub Actions (`.github/workflows/deploy.yaml`).
+
+The workflow:
+
+1. Authenticates to AWS using OIDC (no long-lived keys — see [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md))
+2. Runs tests, dependency audit, and secret scan on pull requests; deploy only on `main`
+3. Runs `sam build && sam deploy` with repository variables/secrets
+4. Uploads `crawl.py` to `CrawlerCodeBucket`
+5. Smoke-tests the MCP endpoint and prints the URL to the job summary
 
 ---
 
 ## Testing
+
+**Offline (no AWS):**
+
+```bash
+./scripts/run-local-tests.sh
+```
+
+**Individual suites:**
 
 ```bash
 cd src/lambda/mcpServer && npm ci && npm test
 python3 -m pytest -q tests   # see CONTRIBUTING.md for /opt/output
 ```
 
-CI: `.github/workflows/deploy.yaml` (test, dependency audit, gitleaks; deploy on `main` only).
+CI runs the same suites in `.github/workflows/deploy.yaml` (test, dependency audit, gitleaks).
 
 ---
 
 ## Repository layout
 
 ```
-infra/main-stack.yaml     # SAM template
-src/crawler/crawl.py      # Playwright worker (EC2)
-src/lambda/mcpServer/     # MCP server + tests
-src/lambda/visualQA*/     # QA trigger + worker
-docs/                     # Architecture, integrations, launch draft
-examples/                 # MCP examples + sample JSON
-scripts/run-local-tests.sh
+infra/
+  main-stack.yaml          SAM/CloudFormation template
+src/
+  crawler/crawl.py         Playwright worker (EC2)
+  lambda/mcpServer/        MCP server + node --test suite
+  lambda/visualQA*/        Visual QA trigger + worker
+scripts/
+  run-local-tests.sh       Offline test harness
+examples/
+  mcp-jsonrpc.md           curl examples
+  response.json            Sample artifact shape
+docs/
+  architecture.md          System reference
+  DEPLOY_CONFIG.md         CI variables and deploy validation
+  INTEGRATIONS.md          Integration opportunities
+.github/workflows/
+  deploy.yaml              CI/CD pipeline
 ```
 
 ---
