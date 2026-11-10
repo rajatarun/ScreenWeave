@@ -22,7 +22,7 @@ Agents and test pipelines often see HTML, not what users see. Screenshots catch 
 
 - Teams building **MCP-connected agents** that need grounded visual context
 - Platform engineers wiring **AWS-native** crawl + QA into existing S3/Dynamo workflows
-- Integrators connecting to **ContextWeave** via `export_session`
+- Integrators feeding crawl output into their own indexing pipelines via `export_session`
 
 **Quick try**
 
@@ -33,7 +33,7 @@ Deploy with SAM (see README), paste the MCP URL into your client, call `crawl_ur
 - **Requires AWS** (not local-first today)
 - Crawls cost **EC2 + S3**; Visual QA costs **Bedrock** and long Lambda runs
 - Default MCP **`audit` mode** allows anonymous calls — use **`enforce`** and tokens before exposing broadly
-- Video generation and ContextWeave export need **extra configuration**
+- Video generation and session export need **extra configuration**
 - DPoP-bound tokens need client-side proof support; server-side replay ledger is **not** implemented
 
 **License:** Apache-2.0

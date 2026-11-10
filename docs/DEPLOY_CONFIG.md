@@ -23,7 +23,7 @@ resources is outside this repository; only new deploys depend on the names below
 | `CIPHERWEAVE_STACK_NAME` | CloudFormation stack exporting CipherWeave `IssuerJwksUrl` / `IssuerId` | `cipherweave-example` |
 | `ALERT_EMAIL` | Email subscribed to ops SNS topic (omit for no subscriber) | `you@example.com` |
 | `OBSERVATORY_METRICS_TABLE_NAME` | Shared Observatory DynamoDB table name | `example-shared-OBSERVATORY_METRICS` |
-| `CONTEXTWEAVE_RAW_BUCKET_NAME` | ContextWeave raw-ingestion bucket for `export_session` | `example-contextweave-raw` |
+| `CONTEXTWEAVE_RAW_BUCKET_NAME` | Raw-ingestion S3 bucket for `export_session` | `example-raw-ingest` |
 
 ## Required repository secret (when Observatory is enabled)
 
@@ -43,7 +43,7 @@ sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     ObservatoryMetricsTableName=example-shared-OBSERVATORY_METRICS \
     ObservatoryMetricsTableArn=arn:aws:dynamodb:us-east-1:123456789012:table/example-shared-OBSERVATORY_METRICS \
-    ContextWeaveRawBucketName=example-contextweave-raw \
+    ContextWeaveRawBucketName=example-raw-ingest \
     AlertEmail=you@example.com
 ```
 

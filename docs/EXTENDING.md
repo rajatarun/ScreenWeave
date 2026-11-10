@@ -51,7 +51,7 @@ Single template: `infra/main-stack.yaml`. New resources should:
 
 | Hook | Env / parameter |
 |------|-------------------|
-| ContextWeave export | `CONTEXTWEAVE_RAW_BUCKET` |
+| Session export | `CONTEXTWEAVE_RAW_BUCKET` |
 | Shared metrics | `OBSERVATORY_METRICS_TABLE` |
 | Video render worker | `VIDEO_WORKER_FUNCTION` |
 | Auth | `AuthMode`, CipherWeave JWKS parameters |

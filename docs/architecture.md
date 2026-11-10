@@ -9,7 +9,7 @@ There are two independent subsystems:
 1. **Crawl Pipeline** — an MCP-compatible HTTP API that triggers an EC2 worker to crawl a site with Playwright and persist artifacts to S3.
 2. **Visual QA Pipeline** — a REST API that reads those artifacts, classifies each screen by visual complexity, feeds the screens through Claude via Bedrock (Haiku 4.5 or Sonnet 4, or no model at all for the simplest screens) in a multi-turn conversation, and writes a structured QA report back to S3.
 
-The MCP server also exposes two tools beyond the crawl: `generate_apple_video` (renders a session as a video job) and `export_session` (copies a session into ContextWeave's raw ingestion prefix).
+The MCP server also exposes two tools beyond the crawl: `generate_apple_video` (renders a session as a video job) and `export_session` (copies a session's text and metadata into a raw-ingestion S3 prefix for downstream indexing).
 
 ---
 
