@@ -14,7 +14,7 @@ ScreenWeave is for teams building **MCP-connected agents** or **AWS-native test 
 |----------|----------|
 | Agent builders | Ground tools with screenshots + `states.json` / `transitions.json` |
 | Platform engineers | SAM-deployed crawl + QA in your AWS account |
-| Weave integrators | `export_session` into ContextWeave; optional Observatory metrics |
+| Weave integrators | `export_session` to a raw-ingestion S3 bucket; optional Observatory metrics |
 
 **Requires AWS** for the stock deployment (EC2, S3, DynamoDB, Lambda, Bedrock for Visual QA). For offline development, run unit tests only (see [5-minute quickstart](#5-minute-quickstart)).
 
@@ -120,7 +120,7 @@ Deep dive: [docs/architecture.md](docs/architecture.md).
 | `get_screenshots` | read | Pre-signed screenshot URLs |
 | `get_metrics` | read | State counts, graph summary |
 | `get_full_session` | read | Bundle of all artifacts |
-| `export_session` | execute | Copy text/metadata to ContextWeave raw prefix (optional) |
+| `export_session` | execute | Copy text/metadata to a raw-ingestion S3 prefix (optional) |
 | `generate_apple_video` | execute | Video job from URL or session (see [docs/swarm-to-video.md](docs/swarm-to-video.md)) |
 
 Optional integrations: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md). Adding tools: [docs/EXTENDING.md](docs/EXTENDING.md).
@@ -160,7 +160,7 @@ Beyond defaults in `infra/main-stack.yaml`, optional integration and auth settin
 | Env var | SAM parameter | Default | Description |
 |---|---|---|---|
 | `OBSERVATORY_METRICS_TABLE` | `ObservatoryMetricsTableName` | *(blank)* | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
-| `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | Enables `export_session` to a ContextWeave raw-ingestion bucket |
+| `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | Enables `export_session` to a raw-ingestion S3 bucket |
 | `AUTH_MODE` | `AuthMode` | `audit` | `audit` or `enforce` for `/mcp` |
 | CipherWeave JWKS | `CipherWeaveJwks*` parameters | *(blank)* | Token verification keys when using an external issuer |
 
@@ -173,7 +173,7 @@ sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     ObservatoryMetricsTableName=<shared-observatory-metrics-table> \
     ObservatoryMetricsTableArn=arn:aws:dynamodb:<region>:123456789012:table/<shared-observatory-metrics-table> \
-    ContextWeaveRawBucketName=<contextweave-raw-ingestion-bucket>
+    ContextWeaveRawBucketName=<raw-ingestion-bucket>
 ```
 
 For **GitHub Actions**, set repository variables and secrets per [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md) instead of embedding account-specific values in the repo. The deploy job validates required settings before `sam deploy`.

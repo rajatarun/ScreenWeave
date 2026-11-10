@@ -9,7 +9,7 @@ Legend: **Implemented** = ships in this repo today; **Planned** = sensible fit, 
 | MCP clients (Claude Desktop, IDE MCP, custom agents) | **High** | Paste `McpClientConfig` stack output; call `tools/call` | Low (docs + URL) | **Implemented** |
 | AWS Bedrock AgentCore Gateway | **High** | Gateway target → MCP endpoint; protocol negotiation in `index.mjs` | Low–Med | **Implemented** (HTTP MCP) |
 | `@weaveaijs/mcp-observatory` / shared DynamoDB metrics | **Med** | Set `OBSERVATORY_METRICS_TABLE` + IAM; spans via `observatory.mjs` | Low | **Implemented** |
-| ContextWeave ingest | **Med** | `export_session` → `CONTEXTWEAVE_RAW_BUCKET` | Low | **Implemented** |
+| Raw-ingestion export | **Med** | `export_session` → `CONTEXTWEAVE_RAW_BUCKET` | Low | **Implemented** |
 | OpenTelemetry (traces/metrics) | **Med** | Export invocation spans from Observatory or Lambda Powertools; correlate `session_id` | Med | Planned |
 | LangChain / LangGraph tools | **High** | Thin wrapper: `StructuredTool` per MCP tool or single `ScreenWeaveToolkit` using HTTP JSON-RPC | Med | Planned |
 | Anthropic / OpenAI SDK (non-Bedrock) | **Low–Med** | Visual QA today is Bedrock-only; optional worker backend for reports | High | Planned |
@@ -62,11 +62,11 @@ def screenweave_crawl(url: str, max_depth: int = 2) -> str:
 
 **Adapter:** AgentCore Gateway MCP target configuration pointing at `McpEndpoint`.
 
-## ContextWeave (medium fit)
+## Raw-ingestion export (medium fit)
 
 **What exists:** `export_session` copies text/metadata to a configured raw bucket with a generated `summary.md`.
 
-**Adapter:** Set `ContextWeaveRawBucketName` at deploy time; run ContextWeave preprocessor on the prefix.
+**Adapter:** Set `ContextWeaveRawBucketName` at deploy time; point your indexing or retrieval pipeline at the `raw/screenweave/` prefix.
 
 ## Local-first note
 
