@@ -233,27 +233,41 @@ jobs:
           OBSERVATORY_TABLE_NAME: ${{ vars.OBSERVATORY_METRICS_TABLE_NAME }}
           OBSERVATORY_TABLE_ARN: ${{ secrets.OBSERVATORY_METRICS_TABLE_ARN }}
           CONTEXTWEAVE_RAW_BUCKET: ${{ vars.CONTEXTWEAVE_RAW_BUCKET_NAME }}
+          AUTH_MODE: ${{ steps.cipherweave.outputs.auth_mode }}
+          CIPHERWEAVE_JWKS: ${{ steps.cipherweave.outputs.jwks_b64 }}
+          CIPHERWEAVE_JWKS_URL: ${{ steps.cipherweave.outputs.jwks_url }}
+          CIPHERWEAVE_ISSUER: ${{ steps.cipherweave.outputs.issuer_id }}
         run: |
           if [ -z "$STACK_NAME" ] || [ -z "$REGION" ]; then
             echo "::error::STACK_NAME and AWS_REGION must be set as repository variables."
             exit 1
           fi
+          # SAM rejects "Key=" for an empty value. Only pass optional overrides
+          # when the value is non-empty; template defaults then apply (or a
+          # previous value is kept on stack update).
+          OVERRIDES=("AuthMode=$AUTH_MODE")
           if [ -n "$ALERT_EMAIL" ]; then
-            ALERT_ARG="AlertEmail=$ALERT_EMAIL"
-          else
-            ALERT_ARG='ParameterKey=AlertEmail,ParameterValue=""'
+            OVERRIDES+=("AlertEmail=$ALERT_EMAIL")
           fi
-          EXTRA_OVERRIDES=()
+          if [ -n "$CIPHERWEAVE_JWKS" ]; then
+            OVERRIDES+=("CipherWeaveJwks=$CIPHERWEAVE_JWKS")
+          fi
+          if [ -n "$CIPHERWEAVE_JWKS_URL" ]; then
+            OVERRIDES+=("CipherWeaveJwksUrl=$CIPHERWEAVE_JWKS_URL")
+          fi
+          if [ -n "$CIPHERWEAVE_ISSUER" ]; then
+            OVERRIDES+=("CipherWeaveIssuer=$CIPHERWEAVE_ISSUER")
+          fi
           if [ -n "$OBSERVATORY_TABLE_NAME" ]; then
-            EXTRA_OVERRIDES+=("ObservatoryMetricsTableName=$OBSERVATORY_TABLE_NAME")
+            OVERRIDES+=("ObservatoryMetricsTableName=$OBSERVATORY_TABLE_NAME")
             if [ -z "$OBSERVATORY_TABLE_ARN" ]; then
               echo "::error::OBSERVATORY_METRICS_TABLE_NAME is set but OBSERVATORY_METRICS_TABLE_ARN (secret) is empty."
               exit 1
             fi
-            EXTRA_OVERRIDES+=("ObservatoryMetricsTableArn=$OBSERVATORY_TABLE_ARN")
+            OVERRIDES+=("ObservatoryMetricsTableArn=$OBSERVATORY_TABLE_ARN")
           fi
           if [ -n "$CONTEXTWEAVE_RAW_BUCKET" ]; then
-            EXTRA_OVERRIDES+=("ContextWeaveRawBucketName=$CONTEXTWEAVE_RAW_BUCKET")
+            OVERRIDES+=("ContextWeaveRawBucketName=$CONTEXTWEAVE_RAW_BUCKET")
           fi
           sam deploy \
             --stack-name "$STACK_NAME" \
@@ -263,13 +277,7 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --tags repo=ScreenWeave Project=ScreenWeave \
-            --parameter-overrides \
-              "$ALERT_ARG" \
-              "AuthMode=${{ steps.cipherweave.outputs.auth_mode }}" \
-              "CipherWeaveJwks=${{ steps.cipherweave.outputs.jwks_b64 }}" \
-              "CipherWeaveJwksUrl=${{ steps.cipherweave.outputs.jwks_url }}" \
-              "CipherWeaveIssuer=${{ steps.cipherweave.outputs.issuer_id }}" \
-              "${EXTRA_OVERRIDES[@]}"
+            --parameter-overrides "${OVERRIDES[@]}"
 
       # crawl.py is not packaged by SAM (it runs on EC2, not Lambda).
       # Upload it to the CrawlerCodeBucket created by CloudFormation.
