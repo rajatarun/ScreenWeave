@@ -9,3 +9,5 @@ src/lambda/**/node_modules/
 .vscode/
 .idea/
 *.swp
+__pycache__/
+*.pyc
