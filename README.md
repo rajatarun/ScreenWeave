@@ -1,56 +1,49 @@
 # ScreenWeave
 
-ScreenWeave is an AWS-native website crawling and visual QA platform. It uses Playwright to walk a site, capture every visual state (including interactive UI transitions), and persist structured artifacts to S3. A separate Visual QA pipeline feeds those artifacts through Claude 3.5 Sonnet via Amazon Bedrock to produce a structured report of anomalies, regressions, and cross-page inconsistencies.
+**Turn any website into structured visual artifacts—screenshots, state graphs, and optional AI QA reports—and drive it from any MCP client over HTTP.**
 
-ScreenWeave is also one node in a larger platform: a completed crawl's text/metadata artifacts can be handed to ContextWeave via the `export_session` tool, which copies them into ContextWeave's `raw/` ingestion prefix for its preprocessor to chunk, embed, and make queryable — crawl → export → ContextWeave ingest. Every MCP tool call (`crawl_url`, `get_session_status`, `get_screenshots`, `get_metrics`, `get_full_session`, `export_session`) is observed through the same shared Observatory gate (`@weaveaijs/mcp-observatory`) used elsewhere in the platform, so invocation telemetry — tool name, argument hash, duration, outcome — lands in one place regardless of which service produced it.
+ScreenWeave is for teams building **MCP-connected agents** or **AWS-native test pipelines** that need what users actually see, not just HTML. It crawls with Playwright on ephemeral EC2, stores artifacts in S3, and exposes crawl control and retrieval via MCP JSON-RPC. An optional Visual QA path analyzes completed sessions with Amazon Bedrock.
 
-Two independent entry points are exposed:
-
-| Entry point | Protocol | Purpose |
-|---|---|---|
-| `POST /mcp` | MCP JSON-RPC 2.0 over HTTP | Trigger crawls, poll status, retrieve screenshots and metrics from any MCP-compatible client |
-| `POST /visual-qa` | REST | Start an asynchronous Visual QA job against a completed crawl session |
+> **Demo GIF:** _Placeholder — add `docs/assets/demo.gif` (see [docs/assets/demo.gif-placeholder.txt](docs/assets/demo.gif-placeholder.txt))._
 
 ---
 
-## Quick start
+## Who it's for
 
-### 1. Deploy
+| Audience | Use case |
+|----------|----------|
+| Agent builders | Ground tools with screenshots + `states.json` / `transitions.json` |
+| Platform engineers | SAM-deployed crawl + QA in your AWS account |
+| Weave integrators | `export_session` into ContextWeave; optional Observatory metrics |
+
+**Requires AWS** for the stock deployment (EC2, S3, DynamoDB, Lambda, Bedrock for Visual QA). For offline development, run unit tests only (see [5-minute quickstart](#5-minute-quickstart)).
+
+---
+
+## 5-minute quickstart
+
+### Path A — No AWS (verify the codebase)
 
 ```bash
-git clone https://github.com/rajatarun/ScreenWeave
+git clone https://github.com/rajatarun/ScreenWeave.git
+cd ScreenWeave
+./scripts/run-local-tests.sh
+```
+
+This runs the MCP server's 110+ unit tests, Python tests, and a synthetic Observatory contract check. No cloud account needed.
+
+### Path B — Deploy to your AWS account
+
+**Prerequisites:** AWS CLI, [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), Bedrock access for Visual QA model IDs in your region.
+
+```bash
+git clone https://github.com/rajatarun/ScreenWeave.git
 cd ScreenWeave
 sam build --template-file infra/main-stack.yaml
-sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM
+sam deploy --stack-name screenweave --resolve-s3 --capabilities CAPABILITY_NAMED_IAM
 ```
 
-After deploy, note the two stack outputs:
-
-```
-McpEndpoint      → https://<id>.execute-api.<region>.amazonaws.com/mcp
-VisualQAEndpoint → https://<id>.execute-api.<region>.amazonaws.com/v1/visual-qa
-```
-
-### 2. Connect an MCP client
-
-Paste the `McpClientConfig` stack output directly into your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "screenweave": {
-      "url": "https://<McpHttpApi>.execute-api.<region>.amazonaws.com/mcp"
-    }
-  }
-}
-```
-
-No AWS credentials are required on the client side. A client authenticates
-with a CipherWeave access token instead — see [Authentication](#authentication).
-
-### 3. Upload the crawler script
-
-`crawl.py` runs on EC2, not Lambda. Upload it after the first deploy:
+Upload the crawler (not packaged as Lambda):
 
 ```bash
 CRAWLER_BUCKET=$(aws cloudformation describe-stacks \
@@ -58,287 +51,160 @@ CRAWLER_BUCKET=$(aws cloudformation describe-stacks \
   --query "Stacks[0].Outputs[?OutputKey=='CrawlerCodeBucketName'].OutputValue" \
   --output text)
 
-aws s3 cp src/crawler/crawl.py s3://${CRAWLER_BUCKET}/crawler/crawl.py --sse AES256
+aws s3 cp src/crawler/crawl.py "s3://${CRAWLER_BUCKET}/crawler/crawl.py" --sse AES256
 ```
 
-This step is automated in CI (`.github/workflows/deploy.yaml`).
+Use stack outputs `McpEndpoint` and `McpClientConfig` for your MCP client.
 
 ---
 
-## MCP tools
+## Core workflow — three copy-paste examples
 
-All tools are invoked via `POST /mcp` using standard MCP JSON-RPC 2.0.
+Full curl variants: [examples/mcp-jsonrpc.md](examples/mcp-jsonrpc.md).
 
-### `crawl_url`
-
-Launch a crawl session against a target URL. Returns a `session_id` immediately while an EC2 worker runs in the background.
-
-```json
-{ "url": "https://example.com", "max_depth": 2, "max_links": 12 }
-```
-
-### `get_session_status`
-
-Poll the status of a crawl session (`RUNNING`, `COMPLETED`, or `FAILED`).
-
-```json
-{ "session_id": "sess-abc123" }
-```
-
-### `get_screenshots`
-
-Retrieve pre-signed S3 URLs for all screenshots captured in a session.
-
-```json
-{ "session_id": "sess-abc123" }
-```
-
-### `get_metrics`
-
-Return computed crawl metrics: total states, unique URLs, transition graph summary, duration.
-
-```json
-{ "session_id": "sess-abc123" }
-```
-
-### `get_full_session`
-
-Return all artifacts for a session in one call: screenshots, `states.json`, `transitions.json`, `trace.zip`.
-
-```json
-{ "session_id": "sess-abc123" }
-```
-
-### `export_session`
-
-Copy a completed session's extracted text/metadata artifacts to ContextWeave's raw ingestion prefix:
-`s3://<CONTEXTWEAVE_RAW_BUCKET>/raw/screenweave/<session_id>/` — `states.json` and `transitions.json`
-verbatim, plus a synthesized `summary.md` (one Markdown section per captured state: URL, trigger,
-headings, interactive elements, visible text preview). Raw screenshots and `trace.zip` are binary and
-are not exported. Requires `CONTEXTWEAVE_RAW_BUCKET` to be set and the session to be `COMPLETED`;
-otherwise the tool returns a clear error rather than failing on a missing S3 grant.
-
-```json
-{ "session_id": "sess-abc123" }
-```
-
----
-
-## Visual QA
-
-The Visual QA pipeline analyses a completed crawl session with Claude 3.5 Sonnet via Bedrock. Screenshots are processed in batches of 10; Claude maintains shared conversation context across all batches so it can detect cross-page regressions and inconsistencies.
-
-### Start a QA job
-
-`POST /visual-qa` needs AWS IAM (SigV4) authentication: the caller's role
-must be allowed `execute-api:Invoke` on the API. Each job runs a 3 GB worker
-for up to 15 minutes with Bedrock calls, so the route is throttled (1 request
-per second, burst 2) and at most two workers run at once; further jobs queue.
+### 1. List MCP tools
 
 ```bash
-curl -X POST https://<VisualQAEndpoint> \
+curl -sS -X POST "$MCP_ENDPOINT" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+### 2. Start a crawl
+
+```bash
+curl -sS -X POST "$MCP_ENDPOINT" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"crawl_url","arguments":{"url":"https://example.com","max_depth":2,"max_links":12}}}'
+```
+
+### 3. Get screenshots after completion
+
+```bash
+curl -sS -X POST "$MCP_ENDPOINT" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_screenshots","arguments":{"session_id":"YOUR_SESSION_ID"}}}'
+```
+
+Poll with `get_session_status` until `status` is `COMPLETED`.
+
+---
+
+## What you get
+
+Two entry points:
+
+| Entry point | Protocol | Purpose |
+|---|---|---|
+| `POST /mcp` | MCP JSON-RPC 2.0 over HTTP | Crawl, poll, screenshots, metrics, export |
+| `POST /visual-qa` | REST (SigV4) | Async Bedrock QA report to S3 |
+
+Artifacts layout:
+
+```
+s3://<ArtifactsBucket>/screenweave/<session_id>/
+├── states.json
+├── transitions.json
+├── trace.zip
+├── screenshots/state_NNNN.png
+└── qa_report.json          # after Visual QA
+```
+
+Deep dive: [docs/architecture.md](docs/architecture.md).
+
+---
+
+## MCP tools (summary)
+
+| Tool | Scope (when enforced) | Role |
+|------|---------------------|------|
+| `crawl_url` | execute | Start EC2 Playwright crawl |
+| `get_session_status` | read | Poll RUNNING / COMPLETED / FAILED |
+| `get_screenshots` | read | Pre-signed screenshot URLs |
+| `get_metrics` | read | State counts, graph summary |
+| `get_full_session` | read | Bundle of all artifacts |
+| `export_session` | execute | Copy text/metadata to ContextWeave raw prefix (optional) |
+| `generate_apple_video` | execute | Video job from URL or session (see [docs/swarm-to-video.md](docs/swarm-to-video.md)) |
+
+Optional integrations: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md). Adding tools: [docs/EXTENDING.md](docs/EXTENDING.md).
+
+---
+
+## Visual QA (REST)
+
+Analyzes a **completed** crawl with tiered Bedrock routing (local heuristics → Haiku → Sonnet). See [docs/cost-calculation.md](docs/cost-calculation.md).
+
+```bash
+curl -X POST "https://<VisualQAEndpoint>" \
   --aws-sigv4 "aws:amz:us-east-1:execute-api" \
-  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
-  -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"session_id": "sess-abc123"}'
+  -d '{"session_id": "YOUR_SESSION_ID"}'
 ```
 
-Response (`202 Accepted`):
-
-```json
-{
-  "job_id": "sess-abc123",
-  "status": "RUNNING",
-  "report_s3_key": "screenweave/sess-abc123/qa_report.json",
-  "message": "QA job started. Poll the report key for results."
-}
-```
-
-### Use prior session context
-
-Pass `parent_session_id` to inject a summary of a previous session's QA report as context before the current analysis begins. Useful for regression detection across deploys.
-
-```bash
-curl -X POST https://<VisualQAEndpoint> \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "sess-new",
-    "parent_session_id": "sess-previous"
-  }'
-```
-
-If the parent report is not found in S3, the step is silently skipped and analysis proceeds normally.
-
-### Fetch the report
-
-The report is written to S3 when the job completes:
-
-```bash
-aws s3 cp s3://<ArtifactsBucket>/screenweave/<session_id>/qa_report.json .
-```
-
-Report shape:
-
-```json
-{
-  "report_version": "1.0",
-  "overall_status": "PASS",
-  "session_id": "sess-abc123",
-  "total_states_analyzed": 24,
-  "total_batches": 3,
-  "findings": [
-    {
-      "state_id": "state_0001",
-      "url": "https://example.com/",
-      "passed": true,
-      "observations": "...",
-      "issues": []
-    }
-  ],
-  "cross_batch_observations": "...",
-  "all_issues": [],
-  "generated_at": "2026-04-15T10:30:00Z"
-}
-```
+Fetch `qa_report.json` from the artifacts bucket when the job finishes.
 
 ---
 
-## S3 artifact layout
+## Authentication (MCP)
 
-```
-s3://<ArtifactsBucket>/
-└── screenweave/
-    └── <session_id>/
-        ├── states.json          # Structured metadata for every crawled state
-        ├── transitions.json     # Directed graph of page transitions
-        ├── trace.zip            # Playwright trace (open with: playwright show-trace)
-        ├── screenshots/
-        │   ├── state_0001.png
-        │   ├── state_0002.png
-        │   └── ...
-        └── qa_report.json       # Written by Visual QA Worker on completion
-```
+`/mcp` supports optional access tokens verified in-process (`src/lambda/mcpServer/auth.mjs`). Deploy parameter `AuthMode`:
+
+- **`audit` (default):** Anonymous requests run (logged); invalid tokens are rejected.
+- **`enforce`:** Valid token and per-tool scopes required.
+
+Before exposing the endpoint publicly, use `enforce` and restrict network access. Details are intentionally high-level here; operators configure issuer/JWKS via SAM parameters. See [SECURITY.md](SECURITY.md) and [docs/security-notes.md](docs/security-notes.md).
 
 ---
 
-## Authentication
+## Configuration (optional)
 
-`/mcp` accepts CipherWeave access tokens: ES256 JWTs with `aud` = `screenweave`,
-verified in-process against the issuer's JWKS (`src/lambda/mcpServer/auth.mjs`,
-the same rules as `cipherweave_verify` in the other Weaves). A token bound to a
-key (`cnf.jkt`) must be sent as `Authorization: DPoP <token>` with a `DPoP`
-proof (RFC 9449); sent as `Bearer` it is refused.
+| Env / parameter | Purpose |
+|-----------------|--------|
+| `OBSERVATORY_METRICS_TABLE` | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
+| `CONTEXTWEAVE_RAW_BUCKET` | Enables `export_session` |
+| `AuthMode` | `audit` or `enforce` |
+| CipherWeave JWKS parameters | Token verification keys |
 
-| Tool | Scope |
-|---|---|
-| `crawl_url`, `generate_apple_video`, `export_session` | `execute` |
-| `get_session_status`, `get_screenshots`, `get_metrics`, `get_full_session` | `read` |
-
-`AuthMode` (repository variable `AUTH_MODE`) decides what happens without a token:
-
-- **`audit`** (default): the request runs and is logged as `mcp auth` with
-  `method: none`. A token that *is* presented is verified, and a bad one is
-  refused with `401`. Scopes are logged, not enforced.
-- **`enforce`**: no token is `401`; a missing scope is `403` before any call in
-  the batch runs; `tools/list` shows only what the token can call.
-
-Audit is the default because TeamWeave calls `/mcp` with no token today (its
-`mcp_client` and its AgentCore gateway target). Switch to `enforce` once no
-`method: none` line appears in the MCP server's logs. Every `401` carries a
-`WWW-Authenticate` challenge pointing at
-`GET /.well-known/oauth-protected-resource` (RFC 9728), which names CipherWeave
-as the authorization server.
-
-## Configuration
-
-Beyond the parameters already wired up by `infra/main-stack.yaml` (table/bucket names, EC2 crawler
-settings), two optional environment variables control cross-platform integration on the MCP server
-Lambda. Both default to blank/disabled — nothing changes unless you set them.
-
-| Env var | SAM parameter | Default | Description |
-|---|---|---|---|
-| `OBSERVATORY_METRICS_TABLE` | `ObservatoryMetricsTableName` | *(blank)* | Shared cross-project Observatory metrics table (see RoutineWeave). When set, every MCP tool call is wrapped in an `@weaveaijs/mcp-observatory` `InvocationWrapper` span and an invocation record (tool name, args hash, duration, outcome) is written here. When unset, or if the package fails to import, tool calls run exactly as before — no telemetry, no behavior change. |
-| `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | ContextWeave's raw ingestion S3 bucket. Enables the `export_session` tool. When unset, `export_session` returns a clear configuration error instead of attempting (and failing) an S3 write. |
-
-Set `ObservatoryMetricsTableArn` alongside `ObservatoryMetricsTableName` — the MCP server's IAM role
-is only granted `dynamodb:PutItem` on that table when the name is non-blank. Likewise, the role is
-only granted `s3:PutObject` under `raw/screenweave/*` in `ContextWeaveRawBucketName` when that
-parameter is set:
+Example deploy overrides (use **your** table/bucket names and ARNs):
 
 ```bash
 sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-    ObservatoryMetricsTableName=tarun-teamweave-shared-OBSERVATORY_METRICS \
-    ObservatoryMetricsTableArn=arn:aws:dynamodb:us-east-1:239571291755:table/tarun-teamweave-shared-OBSERVATORY_METRICS \
-    ContextWeaveRawBucketName=<contextweave-artifacts-bucket>
-```
-
----
-
-## CI/CD
-
-Pushes to `main` that touch `src/`, `infra/main-stack.yaml`, or the workflow file trigger an automatic deploy via GitHub Actions (`.github/workflows/deploy.yaml`).
-
-The workflow:
-1. Authenticates to AWS using OIDC (no long-lived keys — set `ASSUME_ROLE_ARN` in repository variables)
-2. Runs `sam build && sam deploy`
-3. Uploads `crawl.py` to `CrawlerCodeBucket`
-4. Smoke-tests the MCP endpoint and prints the URL to the job summary
-
----
-
-## Repository layout
-
-```
-infra/
-  main-stack.yaml          SAM/CloudFormation template — all infrastructure
-src/
-  crawler/
-    crawl.py               Playwright crawler (runs on EC2)
-  lambda/
-    mcpServer/
-      index.mjs            MCP JSON-RPC server (Node.js 24, HTTP API)
-      observatory.mjs      Shared-gate telemetry wrapper (Observatory)
-      exportSession.mjs    export_session → ContextWeave raw/ upload logic
-      test/                node --test unit tests (npm test)
-    visualQATrigger/
-      handler.py           REST API entry-point — validates & fires Worker (Python 3.12)
-    visualQAWorker/
-      handler.py           Async Bedrock orchestrator — multi-turn Claude QA (Python 3.12)
-.github/
-  workflows/
-    deploy.yaml            CI/CD pipeline
-examples/
-  response.json            Example get_full_session response
-docs/
-  architecture.md          Detailed architecture reference
+    ObservatoryMetricsTableName=<metrics-table-name> \
+    ObservatoryMetricsTableArn=<metrics-table-arn> \
+    ContextWeaveRawBucketName=<contextweave-raw-bucket>
 ```
 
 ---
 
 ## Testing
 
-The MCP server has unit tests using Node's built-in test runner (no extra dependencies):
-
 ```bash
-cd src/lambda/mcpServer
-npm install
-npm test
+cd src/lambda/mcpServer && npm ci && npm test
+python3 -m pytest -q tests   # see CONTRIBUTING.md for /opt/output
 ```
 
-Covers: `withObservability` behaving as a transparent no-op when `OBSERVATORY_METRICS_TABLE` is
-unset, and (when `@weaveaijs/mcp-observatory` is installed) that it still returns the tool's real
-result and real error message on success/failure; and `export_session`'s S3 key layout and upload
-behavior against a stubbed S3 client.
+CI: `.github/workflows/deploy.yaml` (test, dependency audit, gitleaks; deploy on `main` only).
 
 ---
 
-## Prerequisites
+## Repository layout
 
-- AWS CLI configured with permissions to deploy CloudFormation, create IAM roles, and launch EC2
-- AWS SAM CLI (`brew install aws-sam-cli` or see the [installation guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
-- Amazon Bedrock model access enabled for `anthropic.claude-3-5-sonnet-20241022-v2:0` in your region
+```
+infra/main-stack.yaml     # SAM template
+src/crawler/crawl.py      # Playwright worker (EC2)
+src/lambda/mcpServer/     # MCP server + tests
+src/lambda/visualQA*/     # QA trigger + worker
+docs/                     # Architecture, integrations, launch draft
+examples/                 # MCP examples + sample JSON
+scripts/run-local-tests.sh
+```
+
+---
+
+## Contributing & security
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — setup, tests, PR process  
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)  
+- [SECURITY.md](SECURITY.md) — report vulnerabilities privately  
+- [docs/GOOD_FIRST_ISSUES.md](docs/GOOD_FIRST_ISSUES.md) — starter tasks  
 
 ---
 
