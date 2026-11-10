@@ -449,6 +449,54 @@ async def crawl(page, url: str, depth: int) -> None:
             await crawl(page, child_url, depth + 1)
 
 
+# ── QA agent attempt (opt-in) ─────────────────────────────────────────────────
+# Set only when the MCP server's QA tools launched this instance
+# (QA_AGENT_ENABLED). A plain crawl never reaches this code.
+QA_RUN_ID  = os.environ.get("SCREENWEAVE_QA_RUN_ID", "")
+QA_ATTEMPT = os.environ.get("SCREENWEAVE_QA_ATTEMPT", "1")
+
+
+def _mark_qa_attempt_failed(reason: str) -> None:
+    if not DYNAMO_TABLE:
+        return
+    try:
+        _dynamo_client().put_item(
+            TableName=DYNAMO_TABLE,
+            Item={
+                "session_id": {"S": f"QARUN#{QA_RUN_ID}#ATTEMPT#{int(QA_ATTEMPT)}"},
+                "run_id":     {"S": QA_RUN_ID},
+                "attempt":    {"N": str(int(QA_ATTEMPT))},
+                "status":     {"S": "FAILED"},
+                "reason":     {"S": reason[:300]},
+                "updated_at": {"S": now_iso()},
+            },
+        )
+    except Exception as e:
+        log("WARN", "Could not record QA attempt failure", error=str(e))
+
+
+async def run_qa_attempt(page) -> None:
+    """Plan (persisted first), execute and sign off one QA attempt."""
+    try:
+        import qa_agent
+    except ImportError as e:
+        log("ERROR", "QA agent modules are not on this instance", error=str(e))
+        _mark_qa_attempt_failed(f"QA agent modules missing: {e}")
+        return
+    vp = os.environ.get("SCREENWEAVE_QA_VIEWPORT", "")
+    if re.fullmatch(r"\d{3,4}x\d{3,4}", vp):
+        w, h = (int(x) for x in vp.split("x"))
+        await page.set_viewport_size({"width": w, "height": h})
+    try:
+        out = await qa_agent.run_attempt_from_env(page, states, log=log)
+        summary = (out or {}).get("results") or {}
+        log("INFO", "QA attempt finished", run_id=QA_RUN_ID, attempt=QA_ATTEMPT,
+            summary=summary.get("summary"))
+    except Exception as e:
+        # The agent records FAILED itself; the crawl artifacts still upload.
+        log("ERROR", "QA attempt failed", run_id=QA_RUN_ID, attempt=QA_ATTEMPT, error=str(e))
+
+
 # ── Title/outro cards ─────────────────────────────────────────────────────────
 
 def card(path: str, l1: str, l2: str, l3: str = "") -> None:
@@ -509,6 +557,8 @@ async def main() -> None:
         log("DEBUG", "Playwright tracing started", trace_path=TRACE_PATH)
         page = await ctx.new_page()
         await crawl(page, BASE_URL, 0)
+        if QA_RUN_ID:
+            await run_qa_attempt(page)
         await ctx.tracing.stop(path=TRACE_PATH)
         log("DEBUG", "Playwright tracing stopped", trace_path=TRACE_PATH)
         await browser.close()

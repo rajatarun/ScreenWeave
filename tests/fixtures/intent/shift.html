@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cart (late re-render)</title></head>
+<body>
+  <div id="slot">
+    <button id="checkout-btn" onclick="document.body.dataset.result='stale-click'">Checkout</button>
+  </div>
+  <script>
+    // Shortly after load, a banner pushes content down and the app re-renders
+    // the checkout control: the old element (and its id) is gone.
+    setTimeout(() => {
+      const banner = document.createElement('div');
+      banner.style.height = '300px';
+      banner.textContent = 'Free shipping today';
+      document.body.prepend(banner);
+      document.getElementById('slot').innerHTML =
+        '<button class="pay" onclick="document.body.dataset.result=\'checked-out\'">Checkout now</button>';
+    }, 400);
+  </script>
+</body>
+</html>

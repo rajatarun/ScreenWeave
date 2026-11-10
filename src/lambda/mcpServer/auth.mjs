@@ -55,6 +55,11 @@ export const TOOL_SCOPES = {
   get_screenshots: 'read',
   get_metrics: 'read',
   get_full_session: 'read',
+  // QA agent tools (listed only when QA_AGENT_ENABLED is true).
+  start_qa_run: 'execute',
+  continue_qa_run: 'execute',
+  rerun_qa: 'execute',
+  get_qa_run: 'read',
 };
 
 export class AuthError extends Error {

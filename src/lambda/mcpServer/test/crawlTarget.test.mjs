@@ -96,3 +96,18 @@ test('crawl_url refuses an internal target before launching anything', async () 
   });
   assert.match(res.body, /private or internal address/);
 });
+
+test('a plain crawl boot script has no QA lines; a QA attempt adds only validated ones', () => {
+  const base = { sessionId: 'abcd', targetUrl: 'https://example.com/', region: 'us-east-1',
+    table: 't', maxDepth: 1, maxLinks: 2 };
+  const plain = buildUserData(base);
+  assert.ok(!/QA/.test(plain));
+  const qa = buildUserData({ ...base, qa: { runId: 'abcd', attempt: 2, viewport: { width: 390, height: 844 } } });
+  assert.match(qa, /export SCREENWEAVE_QA_RUN_ID="abcd"/);
+  assert.match(qa, /export SCREENWEAVE_QA_ATTEMPT="2"/);
+  assert.match(qa, /export SCREENWEAVE_QA_VIEWPORT="390x844"/);
+  assert.match(qa, /for f in intent_locator.py qa_agent.py signoff_chain.py/);
+  assert.match(qa, /aws s3 sync "\$OUT_DIR\/qa\/" "\$SESSION_S3\/qa\/"/);
+  assert.throws(() => buildUserData({ ...base, qa: { runId: 'a"; rm -rf /', attempt: 1 } }), /Invalid run_id/);
+  assert.throws(() => buildUserData({ ...base, qa: { runId: 'abcd', attempt: '1; reboot' } }), /Invalid attempt/);
+});

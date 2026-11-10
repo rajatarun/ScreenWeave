@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cart (v2)</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  main { padding: 16px; min-height: 900px; }
+  footer { padding: 24px; background: #222; }
+  .cta-x9 { display: inline-block; background: #198754; color: #fff; padding: 12px 24px; cursor: pointer; }
+</style></head>
+<body>
+  <!-- Redesign: the checkout control is a styled div at the bottom with new
+       classes and no id. The v1 selector #checkout-btn no longer exists. -->
+  <main>
+    <h1>Your cart</h1>
+    <p>2 items in your cart.</p>
+    <button onclick="document.body.dataset.result='continued'">Continue shopping</button>
+    <button onclick="document.body.dataset.result='emptied'">Empty cart</button>
+  </main>
+  <footer>
+    <div class="cta-x9" role="button" tabindex="0" aria-label="Checkout"
+         onclick="document.body.dataset.result='checked-out'">Proceed to checkout &rarr;</div>
+  </footer>
+</body>
+</html>

@@ -90,6 +90,17 @@ Parameters:
     Default: urn:cipherweave:prod
     Description: The iss claim CipherWeave tokens must carry.
 
+  # ── QA agent (opt-in) ── see .claude/architecture.md, "QA sessions and run IDs".
+  QAAgentEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Enables the QA agent MCP tools (start_qa_run, continue_qa_run,
+      get_qa_run, rerun_qa) and grants the crawler read access to QA run
+      records and earlier attempts. false (default): the tools are not listed,
+      calls to them are refused, and no IAM statement is added.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conditions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +108,7 @@ Conditions:
   HasObservatoryMetricsTable: !Not [!Equals [!Ref ObservatoryMetricsTableName, '']]
   HasContextWeaveRawBucket: !Not [!Equals [!Ref ContextWeaveRawBucketName, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  QAAgentOn: !Equals [!Ref QAAgentEnabled, 'true']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Globals (apply to all AWS::Serverless::Function resources)
@@ -333,6 +345,21 @@ Resources:
                 Condition:
                   StringEquals:
                     ec2:ResourceTag/Project: ScreenWeave
+        # QA agent (QAAgentEnabled=true only): read the run record the MCP
+        # server wrote and earlier attempts' plans/results under qa/.
+        - !If
+          - QAAgentOn
+          - PolicyName: QAAgentRunAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: dynamodb:GetItem
+                  Resource: !GetAtt SessionsTable.Arn
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub '${ArtifactsBucket.Arn}/screenweave/*/qa/*'
+          - !Ref AWS::NoValue
 
   CrawlerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -459,6 +486,7 @@ Resources:
           CONTEXTWEAVE_RAW_BUCKET:      !Ref ContextWeaveRawBucketName
           MAX_CONCURRENT_CRAWLERS:      "3"
           AUTH_MODE:                    !Ref AuthMode
+          QA_AGENT_ENABLED:             !Ref QAAgentEnabled
           CIPHERWEAVE_JWKS:             !Ref CipherWeaveJwks
           CIPHERWEAVE_JWKS_URL:         !Ref CipherWeaveJwksUrl
           CIPHERWEAVE_ISSUER:           !Ref CipherWeaveIssuer

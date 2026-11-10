@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cart (v1)</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  header { display: flex; justify-content: space-between; padding: 16px; background: #eee; }
+  .btn-primary { background: #0a58ca; color: #fff; padding: 8px 16px; border: 0; }
+</style></head>
+<body>
+  <header>
+    <span>Shop</span>
+    <button id="checkout-btn" class="btn-primary" onclick="document.body.dataset.result='checked-out'">Checkout</button>
+  </header>
+  <main>
+    <p>2 items in your cart.</p>
+    <button onclick="document.body.dataset.result='continued'">Continue shopping</button>
+  </main>
+</body>
+</html>
