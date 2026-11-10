@@ -9,10 +9,15 @@ here. If the contract needs to change — a new namespace, a new reader, a chang
 invariant — change it in `mcp-observatory` and re-vendor the result into every
 consumer repository, keeping the `version` string in step.
 
+The vendored JSON's `description` and `canonical_home` fields may still name a
+specific upstream repository or platform stack from when the file was pinned; that
+is intentional contract metadata, not deploy configuration for this repo.
+
 ### Why a copy at all
 
-The shared `OBSERVATORY_METRICS` DynamoDB table (provisioned by the
-`tarun-teamweave-shared` stack) has **many writers in two languages** and
+The shared `OBSERVATORY_METRICS` DynamoDB table (provisioned by your
+platform's shared Observatory stack — table and stack names are deployment-specific;
+see [docs/DEPLOY_CONFIG.md](../docs/DEPLOY_CONFIG.md)) has **many writers in two languages** and
 **several dashboard readers**, none of which can see each other's source. The
 item shape is therefore a cross-repository interface. It is pinned in one place
 rather than in any single consumer, and each consumer vendors a copy so its own

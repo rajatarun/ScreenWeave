@@ -269,10 +269,12 @@ parameter is set:
 ```bash
 sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-    ObservatoryMetricsTableName=tarun-teamweave-shared-OBSERVATORY_METRICS \
-    ObservatoryMetricsTableArn=arn:aws:dynamodb:us-east-1:239571291755:table/tarun-teamweave-shared-OBSERVATORY_METRICS \
-    ContextWeaveRawBucketName=<contextweave-artifacts-bucket>
+    ObservatoryMetricsTableName=<shared-observatory-metrics-table> \
+    ObservatoryMetricsTableArn=arn:aws:dynamodb:<region>:123456789012:table/<shared-observatory-metrics-table> \
+    ContextWeaveRawBucketName=<contextweave-raw-ingestion-bucket>
 ```
+
+For CI, set the repository variables and secrets listed in [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md) instead of embedding account-specific values in the repo.
 
 ---
 
@@ -281,7 +283,7 @@ sam deploy --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
 Pushes to `main` that touch `src/`, `infra/main-stack.yaml`, or the workflow file trigger an automatic deploy via GitHub Actions (`.github/workflows/deploy.yaml`).
 
 The workflow:
-1. Authenticates to AWS using OIDC (no long-lived keys — set `ASSUME_ROLE_ARN` in repository variables)
+1. Authenticates to AWS using OIDC (no long-lived keys — see [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md))
 2. Runs `sam build && sam deploy`
 3. Uploads `crawl.py` to `CrawlerCodeBucket`
 4. Smoke-tests the MCP endpoint and prints the URL to the job summary
