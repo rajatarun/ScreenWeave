@@ -1,0 +1,8 @@
+Placeholder for project demo GIF.
+
+Add a short recording showing:
+1. MCP tools/list or crawl_url invocation
+2. get_session_status polling to COMPLETED
+3. get_screenshots or qa_report.json result
+
+Recommended: save as docs/assets/demo.gif and update README image link.
