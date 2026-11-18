@@ -160,6 +160,8 @@ Beyond defaults in `infra/main-stack.yaml`, optional integration and auth settin
 | Env var | SAM parameter | Default | Description |
 |---|---|---|---|
 | `OBSERVATORY_METRICS_TABLE` | `ObservatoryMetricsTableName` | *(blank)* | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
+| `SCREENWEAVE_DECISIONS` | *(worker env)* | off | Opt-in Gemini Decisions screen checks (see `.claude/decisions-api.md`) |
+| `GEMINI_API_KEY` | *(worker secret)* | *(blank)* | Required when `SCREENWEAVE_DECISIONS=1` |
 | `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | Enables `export_session` to a raw-ingestion S3 bucket |
 | `AUTH_MODE` | `AuthMode` | `audit` | `audit` or `enforce` for `/mcp` |
 | CipherWeave JWKS | `CipherWeaveJwks*` parameters | *(blank)* | Token verification keys when using an external issuer |

@@ -1,2 +1,3 @@
 # boto3 is provided by the Lambda Python 3.12 runtime.
 Pillow==13.0.0
+google-genai>=3.2

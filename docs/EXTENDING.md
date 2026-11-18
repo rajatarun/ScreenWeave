@@ -36,6 +36,7 @@ Keep parity with Lambda URL validation in `crawlTarget.mjs` for defense in depth
 - **Tier routing:** `image_classifier.py` — adjust thresholds or add signals
 - **Cache:** `cache.py` — perceptual hash cache in DynamoDB
 - **Preprocessing:** `preprocessor.py` — image bytes before Bedrock
+- **Decisions (opt-in):** `screen_decisions.py` — Gemini Decisions screen checks; see `.claude/decisions-api.md`. Flag `SCREENWEAVE_DECISIONS=1`, CLI `scripts/screen_decisions_cli.py`
 
 Worker env vars come from `infra/main-stack.yaml`. Long-running changes need timeout/memory review (900s / 3 GB default).
 

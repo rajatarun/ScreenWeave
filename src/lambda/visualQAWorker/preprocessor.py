@@ -23,6 +23,7 @@ import math
 from PIL import Image
 
 from image_classifier import is_ui_content
+import screen_decisions as _decisions
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,23 @@ def preprocess(data: bytes, force_png: bool = False) -> tuple[bytes, str]:
         img = img.resize((new_w, new_h), Image.LANCZOS)
 
     # ── Format selection ───────────────────────────────────────────────────────
-    use_png = force_png or is_ui_content(img)
+    if force_png:
+        use_png = True
+        ui_path = "forced_png"
+    elif _decisions.decisions_enabled():
+        enc = io.BytesIO()
+        save_fmt = "PNG" if img.mode in ("RGBA", "P", "LA") else img.format or "PNG"
+        if save_fmt not in ("PNG", "JPEG"):
+            save_fmt = "PNG"
+        img.save(enc, format=save_fmt)
+        use_png, ui_path = _decisions.resolve_is_ui_content(
+            enc.getvalue(),
+            lambda: is_ui_content(img),
+        )
+    else:
+        use_png = is_ui_content(img)
+        ui_path = "heuristic"
+    logger.debug("UI content detection path=%s use_png=%s", ui_path, use_png)
 
     buf = io.BytesIO()
     if use_png:
