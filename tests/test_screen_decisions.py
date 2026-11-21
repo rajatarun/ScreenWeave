@@ -164,6 +164,7 @@ def test_image_payload_construction():
     assert blocks[0]["type"] == "text"
     assert blocks[1]["type"] == "image"
     assert blocks[1]["mime_type"] == "image/png"
+    assert blocks[1]["resolution"] == "low"
     raw = base64.b64decode(blocks[1]["data"])
     assert raw[:8] == b"\x89PNG\r\n\x1a\n"
 

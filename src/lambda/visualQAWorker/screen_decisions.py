@@ -9,7 +9,8 @@ existing heuristics unchanged. When on, the Decisions path runs first; on API
 error, timeout, missing key, malformed response, or low confidence the module
 falls back and records which path was used.
 
-Auth: GEMINI_API_KEY (never logged). Model: gemini-decision-1, API v1beta only.
+Auth: GEMINI_API_KEY or Secrets Manager (GEMINI_SECRET_NAME, cached; never logged).
+Model: gemini-decision-1, API v1beta only.
 """
 
 from __future__ import annotations
@@ -223,8 +224,10 @@ def _low_confidence(answers: dict[str, NormalizedAnswer], min_confidence: float)
 
 
 def create_genai_client() -> DecisionsClient | None:
-    """Build a real Gemini client when GEMINI_API_KEY is set."""
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    """Build a real Gemini client when an API key is available."""
+    from gemini_secrets import get_gemini_api_key
+
+    api_key = get_gemini_api_key()
     if not api_key:
         return None
     try:

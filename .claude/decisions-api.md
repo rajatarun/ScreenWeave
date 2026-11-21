@@ -8,8 +8,9 @@ Optional fast path for **screen-state checks** on crawled screenshots (and short
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `SCREENWEAVE_DECISIONS` | off | `1` / `on` enables the Decisions path |
-| `GEMINI_API_KEY` | unset | Required when Decisions is on |
+| `SCREENWEAVE_DECISIONS` | `0` | SAM param / worker env — `1` enables the Decisions path |
+| `GEMINI_SECRET_NAME` | `gemini/api_key` | Secrets Manager secret id (us-east-1) for production |
+| `GEMINI_API_KEY` | unset | Local/CLI override; worker loads from Secrets Manager when unset |
 | `SCREENWEAVE_DECISIONS_MIN_CONFIDENCE` | `0.6` | Below this, fall back to heuristics |
 | `SCREENWEAVE_DECISIONS_TIMEOUT_SEC` | `15` | Per-call timeout |
 | `WEAVE_DECISIONS_LIVE` | off | With `GEMINI_API_KEY`, enables the skipped live pytest |
