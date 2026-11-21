@@ -19,7 +19,7 @@ Default state: **off** (`SCREENWEAVE_DECISIONS=0`). No `WEAVE_DECISIONS_LIVE` in
 2. Add or set repository variable:
    - **Name:** `SCREENWEAVE_DECISIONS`
    - **Value:** `1`
-3. Merge to `main` (or run **Deploy ScreenWeave** workflow dispatch) so deploy passes `SCREENWEAVE_DECISIONS=1` to the SAM parameter on **VisualQA-Worker**.
+3. Merge to `main` (or run **Deploy ScreenWeave** workflow dispatch) so deploy passes `ScreenWeaveDecisions=1` (SAM parameter) on **VisualQA-Worker**.
 
 Worker environment (from template):
 
