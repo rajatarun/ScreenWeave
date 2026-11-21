@@ -75,7 +75,9 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _clear_decisions_flag(monkeypatch):
     monkeypatch.delenv(sd.FLAG_ENV, raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # Keep GEMINI_API_KEY only for the opted-in live smoke test (skipif at collect time).
+    if os.environ.get("WEAVE_DECISIONS_LIVE") != "1":
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
 
 def test_flag_off_returns_heuristic_path():
