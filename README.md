@@ -160,8 +160,9 @@ Beyond defaults in `infra/main-stack.yaml`, optional integration and auth settin
 | Env var | SAM parameter | Default | Description |
 |---|---|---|---|
 | `OBSERVATORY_METRICS_TABLE` | `ObservatoryMetricsTableName` | *(blank)* | Shared MCP invocation telemetry (`@weaveaijs/mcp-observatory`) |
-| `SCREENWEAVE_DECISIONS` | *(worker env)* | off | Opt-in Gemini Decisions screen checks (see `.claude/decisions-api.md`) |
-| `GEMINI_API_KEY` | *(worker secret)* | *(blank)* | Required when `SCREENWEAVE_DECISIONS=1` |
+| `SCREENWEAVE_DECISIONS` | `SCREENWEAVE_DECISIONS` | `0` | `1` enables Gemini Decisions UI check on VisualQA-Worker (see `.claude/decisions-enable.md`) |
+| `GEMINI_SECRET_NAME` | *(worker env)* | `gemini/api_key` | Secrets Manager id in **us-east-1** when Decisions is on |
+| `GEMINI_API_KEY` | *(local only)* | *(unset)* | Optional override for CLI/tests; production uses Secrets Manager |
 | `CONTEXTWEAVE_RAW_BUCKET` | `ContextWeaveRawBucketName` | *(blank)* | Enables `export_session` to a raw-ingestion S3 bucket |
 | `AUTH_MODE` | `AuthMode` | `audit` | `audit` or `enforce` for `/mcp` |
 | CipherWeave JWKS | `CipherWeaveJwks*` parameters | *(blank)* | Token verification keys when using an external issuer |

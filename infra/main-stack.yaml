@@ -101,6 +101,15 @@ Parameters:
       records and earlier attempts. false (default): the tools are not listed,
       calls to them are refused, and no IAM statement is added.
 
+  SCREENWEAVE_DECISIONS:
+    Type: String
+    Default: '0'
+    AllowedValues: ['0', '1']
+    Description: >
+      Visual QA worker Gemini Decisions UI-content check. 0 (default): Pillow
+      heuristic only. 1: try Decisions first, fall back on error. Production
+      enables via the repository variable SCREENWEAVE_DECISIONS=1.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conditions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +448,13 @@ Resources:
                   # Haiku 4.5 — Tier 2 (routine batches, supports vision, cheaper than Sonnet)
                   - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0'
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0'
+        - PolicyName: GeminiApiKeySecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:us-east-1:${AWS::AccountId}:secret:gemini/api_key-*'
 
   CrawlerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -591,6 +607,9 @@ Resources:
           ROUTING_ENABLED:      "true"
           CACHE_ENABLED:        "true"
           MAX_TOKENS_PER_IMAGE: "5000"
+          SCREENWEAVE_DECISIONS: !Ref SCREENWEAVE_DECISIONS
+          GEMINI_SECRET_NAME: gemini/api_key
+          GEMINI_SECRET_REGION: us-east-1
       Tags:
         Project: ScreenWeave
 

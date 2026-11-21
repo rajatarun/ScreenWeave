@@ -237,6 +237,7 @@ jobs:
           CIPHERWEAVE_JWKS: ${{ steps.cipherweave.outputs.jwks_b64 }}
           CIPHERWEAVE_JWKS_URL: ${{ steps.cipherweave.outputs.jwks_url }}
           CIPHERWEAVE_ISSUER: ${{ steps.cipherweave.outputs.issuer_id }}
+          SCREENWEAVE_DECISIONS: ${{ vars.SCREENWEAVE_DECISIONS || '0' }}
         run: |
           if [ -z "$STACK_NAME" ] || [ -z "$REGION" ]; then
             echo "::error::STACK_NAME and AWS_REGION must be set as repository variables."
@@ -245,7 +246,7 @@ jobs:
           # SAM rejects "Key=" for an empty value. Only pass optional overrides
           # when the value is non-empty; template defaults then apply (or a
           # previous value is kept on stack update).
-          OVERRIDES=("AuthMode=$AUTH_MODE")
+          OVERRIDES=("AuthMode=$AUTH_MODE" "SCREENWEAVE_DECISIONS=$SCREENWEAVE_DECISIONS")
           if [ -n "$ALERT_EMAIL" ]; then
             OVERRIDES+=("AlertEmail=$ALERT_EMAIL")
           fi
