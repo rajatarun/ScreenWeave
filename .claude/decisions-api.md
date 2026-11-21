@@ -8,7 +8,7 @@ Optional fast path for **screen-state checks** on crawled screenshots (and short
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `SCREENWEAVE_DECISIONS` | `0` | SAM param / worker env — `1` enables the Decisions path |
+| `SCREENWEAVE_DECISIONS` | `0` | Worker env (from SAM `ScreenWeaveDecisions`) — `1` enables the Decisions path |
 | `GEMINI_SECRET_NAME` | `gemini/api_key` | Secrets Manager secret id (us-east-1) for production |
 | `GEMINI_API_KEY` | unset | Local/CLI override; worker loads from Secrets Manager when unset |
 | `SCREENWEAVE_DECISIONS_MIN_CONFIDENCE` | `0.6` | Below this, fall back to heuristics |

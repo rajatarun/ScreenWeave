@@ -101,7 +101,7 @@ Parameters:
       records and earlier attempts. false (default): the tools are not listed,
       calls to them are refused, and no IAM statement is added.
 
-  SCREENWEAVE_DECISIONS:
+  ScreenWeaveDecisions:
     Type: String
     Default: '0'
     AllowedValues: ['0', '1']
@@ -607,7 +607,7 @@ Resources:
           ROUTING_ENABLED:      "true"
           CACHE_ENABLED:        "true"
           MAX_TOKENS_PER_IMAGE: "5000"
-          SCREENWEAVE_DECISIONS: !Ref SCREENWEAVE_DECISIONS
+          SCREENWEAVE_DECISIONS: !Ref ScreenWeaveDecisions
           GEMINI_SECRET_NAME: gemini/api_key
           GEMINI_SECRET_REGION: us-east-1
       Tags:

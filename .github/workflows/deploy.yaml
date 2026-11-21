@@ -246,7 +246,7 @@ jobs:
           # SAM rejects "Key=" for an empty value. Only pass optional overrides
           # when the value is non-empty; template defaults then apply (or a
           # previous value is kept on stack update).
-          OVERRIDES=("AuthMode=$AUTH_MODE" "SCREENWEAVE_DECISIONS=$SCREENWEAVE_DECISIONS")
+          OVERRIDES=("AuthMode=$AUTH_MODE" "ScreenWeaveDecisions=$SCREENWEAVE_DECISIONS")
           if [ -n "$ALERT_EMAIL" ]; then
             OVERRIDES+=("AlertEmail=$ALERT_EMAIL")
           fi
