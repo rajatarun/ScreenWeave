@@ -57,21 +57,25 @@ def test_validate_url_blocks_schemes_metadata_and_unlisted_lan() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_local_browser_session_single_tab_lifecycle(tmp_path: Path) -> None:
-    page = _FakePage()
-    sess = LocalBrowserSession(allow_lan_hosts=("192.168.1.50",), resolve_dns=False)
-    await sess.start(page_override=page)
+def test_local_browser_session_single_tab_lifecycle(tmp_path: Path) -> None:
+    import asyncio
 
-    info = await sess.goto("http://192.168.1.50/dashboard")
-    assert info["title"] == "Local Home Dashboard"
-    await sess.fill("#search", "lights")
-    await sess.click("#submit")
-    assert await sess.extract_text("main") == "text(main)"
-    shot = await sess.screenshot(tmp_path / "shot.png")
-    assert shot.exists()
+    async def _run() -> None:
+        page = _FakePage()
+        sess = LocalBrowserSession(allow_lan_hosts=("192.168.1.50",), resolve_dns=False)
+        await sess.start(page_override=page)
 
-    with pytest.raises(LocalBrowserPolicyError):
-        await sess.goto("http://10.0.0.1/internal")
+        info = await sess.goto("http://192.168.1.50/dashboard")
+        assert info["title"] == "Local Home Dashboard"
+        await sess.fill("#search", "lights")
+        await sess.click("#submit")
+        assert await sess.extract_text("main") == "text(main)"
+        shot = await sess.screenshot(tmp_path / "shot.png")
+        assert shot.exists()
 
-    await sess.close()
+        with pytest.raises(LocalBrowserPolicyError):
+            await sess.goto("http://10.0.0.1/internal")
+
+        await sess.close()
+
+    asyncio.run(_run())
