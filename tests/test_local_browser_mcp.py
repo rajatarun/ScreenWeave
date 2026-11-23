@@ -106,7 +106,16 @@ def test_mcp_initialize_and_tools_list() -> None:
             server=server,
         )
         names = [t["name"] for t in list_resp["result"]["tools"]]
-        assert names == ["navigate", "extract_text", "click", "close"]
+        assert names == [
+            "navigate",
+            "extract_text",
+            "click",
+            "close",
+            "browser_extract_links",
+            "browser_fill_input",
+            "browser_snapshot_dom",
+            "browser_action_log",
+        ]
 
     asyncio.run(_run())
 

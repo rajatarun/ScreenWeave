@@ -74,6 +74,53 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "browser_extract_links",
+        "description": "Extract links from the active page with SSRF URL validation tags.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_links": {"type": "integer", "default": 50},
+                "include_blocked": {"type": "boolean", "default": True},
+                "session_id": {"type": "string", "default": "default"},
+            },
+        },
+    },
+    {
+        "name": "browser_fill_input",
+        "description": "Fill an input matching a CSS selector in an active session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string"},
+                "value": {"type": "string"},
+                "redact_value": {"type": "boolean", "default": False},
+                "session_id": {"type": "string", "default": "default"},
+            },
+            "required": ["selector", "value"],
+        },
+    },
+    {
+        "name": "browser_snapshot_dom",
+        "description": "Capture a compact, token-budgeted DOM summary for edge LLM consumption.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_chars": {"type": "integer", "default": 2000},
+                "session_id": {"type": "string", "default": "default"},
+            },
+        },
+    },
+    {
+        "name": "browser_action_log",
+        "description": "Return the sequential action audit log for an active browser session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "default": "default"},
+            },
+        },
+    },
 ]
 
 
@@ -189,6 +236,36 @@ class LocalBrowserMCPServer:
                 return {"session_id": session_id, "closed": True}
             return {"session_id": session_id, "closed": False}
 
+        if name == "browser_extract_links":
+            max_links = int(args.get("max_links", 50))
+            include_blocked = bool(args.get("include_blocked", True))
+            session = self._require_session(session_id)
+            links = await session.extract_links(max_links=max_links, include_blocked=include_blocked)
+            return {"session_id": session_id, "links": links, "count": len(links)}
+
+        if name == "browser_fill_input":
+            selector = args.get("selector")
+            value = args.get("value")
+            if not isinstance(selector, str) or not selector.strip():
+                raise ValueError("browser_fill_input requires a non-empty 'selector' string")
+            if not isinstance(value, str):
+                raise ValueError("browser_fill_input requires a string 'value'")
+            redact_value = bool(args.get("redact_value", False))
+            session = self._require_session(session_id)
+            result = await session.fill_input(selector, value, redact_value=redact_value)
+            return {"session_id": session_id, **result}
+
+        if name == "browser_snapshot_dom":
+            max_chars = int(args.get("max_chars", 2000))
+            session = self._require_session(session_id)
+            summary = await session.snapshot_dom_summary(max_chars=max_chars)
+            return {"session_id": session_id, **summary}
+
+        if name == "browser_action_log":
+            session = self._require_session(session_id)
+            actions = session.get_action_log()
+            return {"session_id": session_id, "actions": actions, "count": len(actions)}
+
         raise LookupError(f"Unknown browser tool: {name!r}")
 
     async def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -236,7 +313,16 @@ class LocalBrowserMCPServer:
                 )
 
             direct_name = method.removeprefix("browser/")
-            if direct_name in ("navigate", "extract_text", "click", "close"):
+            if direct_name in (
+                "navigate",
+                "extract_text",
+                "click",
+                "close",
+                "browser_extract_links",
+                "browser_fill_input",
+                "browser_snapshot_dom",
+                "browser_action_log",
+            ):
                 payload = await self._dispatch_tool(direct_name, params)
                 return _jsonrpc_result(req_id, payload)
 
