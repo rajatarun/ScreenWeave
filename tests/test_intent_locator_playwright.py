@@ -31,6 +31,7 @@ for _name in ("playwright.async_api", "playwright"):
         del sys.modules[_name]
 
 async_api = pytest.importorskip("playwright.async_api")
+pytestmark = pytest.mark.playwright
 
 SELECTOR = "#checkout-btn"
 INTENT = "checkout"

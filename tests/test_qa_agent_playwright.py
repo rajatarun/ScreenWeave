@@ -29,6 +29,7 @@ for _name in ("playwright.async_api", "playwright"):
     if _mod is not None and getattr(_mod, "__file__", None) is None:
         del sys.modules[_name]
 async_api = pytest.importorskip("playwright.async_api")
+pytestmark = pytest.mark.playwright
 
 
 @pytest.fixture(scope="module")

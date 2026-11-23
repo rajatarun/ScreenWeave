@@ -37,8 +37,9 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
@@ -82,9 +83,11 @@ async def guard_request(route) -> None:
 
 # ── Config from environment (set by startCrawl Lambda UserData) ───────────────
 BASE_URL    = sys.argv[1] if len(sys.argv) > 1 else ""
-OUT_DIR     = "/opt/output"
-SCREENS_DIR = f"{OUT_DIR}/screenshots"
-TRACE_PATH  = f"{OUT_DIR}/trace.zip"
+OUT_DIR     = os.environ.get("SCREENWEAVE_OUT_DIR") or os.path.join(
+    tempfile.gettempdir(), "screenweave-output"
+)
+SCREENS_DIR = os.path.join(OUT_DIR, "screenshots")
+TRACE_PATH  = os.path.join(OUT_DIR, "trace.zip")
 
 # If launched by startCrawl Lambda, SESSION_ID is pre-generated; else create one.
 SESSION_ID  = os.environ.get("SCREENWEAVE_SESSION_ID") or str(uuid.uuid4())
@@ -97,7 +100,10 @@ S3_PREFIX    = os.environ.get("SCREENWEAVE_S3_PREFIX", "screenweave")
 REGION       = os.environ.get("SCREENWEAVE_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 LOG_LEVEL    = os.environ.get("SCREENWEAVE_LOG_LEVEL", "INFO").upper()
 
-os.makedirs(SCREENS_DIR, exist_ok=True)
+
+def ensure_output_dirs() -> None:
+    """Create output and screenshots directories lazily at crawl runtime."""
+    os.makedirs(SCREENS_DIR, exist_ok=True)
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 seen        = set()
@@ -225,7 +231,7 @@ def write_session_completed(summary_stats, artifact_manifest):
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def slug(url: str) -> str:
@@ -275,15 +281,18 @@ async def wait_for_idle(page, timeout: int = 5000) -> None:
 
 # ── State capture ─────────────────────────────────────────────────────────────
 
-async def capture_state(page, trigger_action: str = None, trigger_label: str = None) -> dict:
+async def capture_state(
+    page, trigger_action: str | None = None, trigger_label: str | None = None
+) -> dict:
     """
     Record one visual state: screenshot + DOM metadata + transition edge.
     This is the core data unit consumed by visual QA agents.
     """
+    ensure_output_dirs()
     state_ctr[0] += 1
     state_id  = f"state_{state_ctr[0]:04d}"
     ts        = now_iso()
-    shot_path = f"{SCREENS_DIR}/{state_id}.png"
+    shot_path = os.path.join(SCREENS_DIR, f"{state_id}.png")
 
     await page.screenshot(path=shot_path, full_page=True)
 
@@ -518,7 +527,8 @@ def card(path: str, l1: str, l2: str, l3: str = "") -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    crawl_start = datetime.now(timezone.utc)
+    ensure_output_dirs()
+    crawl_start = datetime.now(UTC)
 
     log(
         "INFO",
@@ -599,7 +609,7 @@ async def main() -> None:
         )
     log("INFO", "Wrote transitions manifest", path=f"{OUT_DIR}/transitions.json", total_transitions=len(transitions))
 
-    crawl_end = datetime.now(timezone.utc)
+    crawl_end = datetime.now(UTC)
     duration_sec = int((crawl_end - crawl_start).total_seconds())
 
     log("INFO", "Crawl complete", total_states=len(states), total_transitions=len(transitions), duration_seconds=duration_sec)
