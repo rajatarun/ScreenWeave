@@ -14,9 +14,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from .local_browser import LocalBrowserPolicyError, LocalBrowserSession, validate_url
+    from .local_browser import (
+        LocalBrowserPolicyError,
+        LocalBrowserSession,
+        diff_snapshots,
+        validate_url,
+    )
 except ImportError:
-    from local_browser import LocalBrowserPolicyError, LocalBrowserSession, validate_url
+    from local_browser import (
+        LocalBrowserPolicyError,
+        LocalBrowserSession,
+        diff_snapshots,
+        validate_url,
+    )
 
 JSONRPC_VERSION = "2.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -119,6 +129,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "session_id": {"type": "string", "default": "default"},
             },
+        },
+    },
+    {
+        "name": "browser_extract_tables",
+        "description": "Extract compact structured HTML tables from the active browser session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_tables": {"type": "integer", "default": 10},
+                "max_rows": {"type": "integer", "default": 25},
+                "session_id": {"type": "string", "default": "default"},
+            },
+        },
+    },
+    {
+        "name": "browser_diff_snapshots",
+        "description": "Compare two DOM summary snapshots and return structured URL, title, text, and interactive deltas.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "before": {"type": "object", "description": "Earlier snapshot_dom_summary() output."},
+                "after": {"type": "object", "description": "Later snapshot_dom_summary() output."},
+            },
+            "required": ["before", "after"],
         },
     },
 ]
@@ -266,6 +300,20 @@ class LocalBrowserMCPServer:
             actions = session.get_action_log()
             return {"session_id": session_id, "actions": actions, "count": len(actions)}
 
+        if name == "browser_extract_tables":
+            max_tables = int(args.get("max_tables", 10))
+            max_rows = int(args.get("max_rows", 25))
+            session = self._require_session(session_id)
+            tables = await session.extract_tables(max_tables=max_tables, max_rows=max_rows)
+            return {"session_id": session_id, "tables": tables, "count": len(tables)}
+
+        if name == "browser_diff_snapshots":
+            before = args.get("before")
+            after = args.get("after")
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                raise ValueError("browser_diff_snapshots requires dict 'before' and 'after' arguments")
+            return diff_snapshots(before, after)
+
         raise LookupError(f"Unknown browser tool: {name!r}")
 
     async def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -322,6 +370,8 @@ class LocalBrowserMCPServer:
                 "browser_fill_input",
                 "browser_snapshot_dom",
                 "browser_action_log",
+                "browser_extract_tables",
+                "browser_diff_snapshots",
             ):
                 payload = await self._dispatch_tool(direct_name, params)
                 return _jsonrpc_result(req_id, payload)

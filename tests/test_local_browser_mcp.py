@@ -115,6 +115,8 @@ def test_mcp_initialize_and_tools_list() -> None:
             "browser_fill_input",
             "browser_snapshot_dom",
             "browser_action_log",
+            "browser_extract_tables",
+            "browser_diff_snapshots",
         ]
 
     asyncio.run(_run())
