@@ -119,6 +119,7 @@ def test_mcp_initialize_and_tools_list() -> None:
             "browser_diff_snapshots",
             "browser_extract_forms",
             "browser_run_sequence",
+            "browser_check_regression",
         ]
 
     asyncio.run(_run())

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
+    from .archive import PageArchiveStore
     from .local_browser import (
         LocalBrowserPolicyError,
         LocalBrowserSession,
@@ -21,6 +22,7 @@ try:
         validate_url,
     )
 except ImportError:
+    from archive import PageArchiveStore
     from local_browser import (
         LocalBrowserPolicyError,
         LocalBrowserSession,
@@ -184,6 +186,28 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["steps"],
         },
     },
+    {
+        "name": "browser_check_regression",
+        "description": "Check the current page DOM summary (or provided summary) against an archived baseline in PageArchiveStore.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "page_key": {"type": "string", "description": "Logical page key in PageArchiveStore."},
+                "current_dom_summary": {
+                    "type": "object",
+                    "description": "Optional DOM summary dict; if omitted, snapshots the active session.",
+                },
+                "max_changed_ratio": {"type": "number", "default": 0.25},
+                "baseline_label": {"type": "string", "default": "baseline"},
+                "db_path": {
+                    "type": "string",
+                    "description": "Optional SQLite path when server has no default archive_store.",
+                },
+                "session_id": {"type": "string", "default": "default"},
+            },
+            "required": ["page_key"],
+        },
+    },
 ]
 
 
@@ -213,6 +237,7 @@ class LocalBrowserMCPServer:
     resolve_dns: bool = True
     idle_timeout_sec: float = 300.0
     page_factory: Callable[[], Any] | None = None
+    archive_store: PageArchiveStore | None = None
     clock: Callable[[], float] = time.monotonic
     _sessions: dict[str, _SessionEntry] = field(default_factory=dict, repr=False)
 
@@ -364,6 +389,41 @@ class LocalBrowserMCPServer:
             seq_result = await session.run_action_sequence(steps, stop_on_error=stop_on_error)
             return {"session_id": session_id, **seq_result}
 
+        if name == "browser_check_regression":
+            page_key = args.get("page_key")
+            if not isinstance(page_key, str) or not page_key.strip():
+                raise ValueError("browser_check_regression requires a non-empty 'page_key' string")
+            max_changed_ratio = float(args.get("max_changed_ratio", 0.25))
+            baseline_label = str(args.get("baseline_label") or "baseline")
+            current_dom = args.get("current_dom_summary")
+            if current_dom is None:
+                session = self._require_session(session_id)
+                current_dom = await session.snapshot_dom_summary()
+            elif not isinstance(current_dom, dict):
+                raise ValueError("browser_check_regression 'current_dom_summary' must be an object")
+
+            if self.archive_store is not None:
+                return self.archive_store.check_dom_regression(
+                    page_key,
+                    current_dom,
+                    max_changed_ratio=max_changed_ratio,
+                    baseline_label=baseline_label,
+                )
+
+            db_path = args.get("db_path")
+            if isinstance(db_path, str) and db_path.strip():
+                with PageArchiveStore(db_path.strip()) as temp_store:
+                    return temp_store.check_dom_regression(
+                        page_key,
+                        current_dom,
+                        max_changed_ratio=max_changed_ratio,
+                        baseline_label=baseline_label,
+                    )
+
+            raise ValueError(
+                "browser_check_regression requires an archive_store on the server or a 'db_path' argument"
+            )
+
         raise LookupError(f"Unknown browser tool: {name!r}")
 
     async def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -424,6 +484,7 @@ class LocalBrowserMCPServer:
                 "browser_diff_snapshots",
                 "browser_extract_forms",
                 "browser_run_sequence",
+                "browser_check_regression",
             ):
                 payload = await self._dispatch_tool(direct_name, params)
                 return _jsonrpc_result(req_id, payload)
