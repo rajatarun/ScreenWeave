@@ -65,6 +65,52 @@ _EXTRACT_TABLES_JS = """() => {
   });
 }"""
 
+_EXTRACT_FORMS_JS = """() => {
+  return Array.from(document.querySelectorAll('form')).map((form, idx) => {
+    const labelsByFor = {};
+    form.querySelectorAll('label[for]').forEach(lbl => {
+      const targetId = lbl.getAttribute('for');
+      if (targetId) {
+        labelsByFor[targetId] = (lbl.innerText || lbl.textContent || '').trim();
+      }
+    });
+    const selector = 'input:not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]), textarea, select';
+    const fields = Array.from(form.querySelectorAll(selector)).map(el => {
+      const tag = el.tagName.toLowerCase();
+      const fieldType = tag === 'input'
+        ? (el.getAttribute('type') || 'text').trim().toLowerCase()
+        : tag;
+      const name = (el.getAttribute('name') || el.getAttribute('id') || '').trim();
+      const elId = (el.getAttribute('id') || '').trim();
+      let label = (elId && labelsByFor[elId]) || '';
+      if (!label) {
+        const parentLabel = el.closest ? el.closest('label') : null;
+        if (parentLabel) {
+          label = (parentLabel.innerText || parentLabel.textContent || '').trim();
+        }
+      }
+      if (!label) {
+        label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
+      }
+      return {
+        name,
+        field_type: fieldType,
+        label,
+        required: el.hasAttribute('required')
+      };
+    });
+    return {
+      form_index: idx,
+      action: (form.getAttribute('action') || '').trim(),
+      method: (form.getAttribute('method') || 'GET').trim().toUpperCase(),
+      fields
+    };
+  });
+}"""
+
+_NON_DATA_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
+_SECRET_SELECTOR_HINTS = ("password", "passwd", "pwd", "secret", "token", "api_key", "apikey")
+
 
 class _HTMLTableParser(HTMLParser):
     """Minimal stdlib HTML table extractor used as a fallback when page.content() is available."""
@@ -145,6 +191,117 @@ def _parse_html_tables(html: str) -> list[dict[str, Any]]:
     parser.feed(html)
     parser.close()
     return parser.tables
+
+
+class _HTMLFormParser(HTMLParser):
+    """Minimal stdlib HTML form extractor that never reads or exposes field values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[dict[str, Any]] = []
+        self._form_depth = 0
+        self._current_action = ""
+        self._current_method = "GET"
+        self._current_fields: list[dict[str, Any]] = []
+        self._labels_by_for: dict[str, str] = {}
+        self._in_label = False
+        self._label_for = ""
+        self._label_buf: list[str] = []
+        self._label_wrapped_field_indices: list[int] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        attr_map = {k.lower(): v for k, v in attrs}
+        if t == "form":
+            self._form_depth += 1
+            if self._form_depth == 1:
+                self._current_action = str(attr_map.get("action") or "").strip()
+                raw_method = str(attr_map.get("method") or "GET").strip().upper()
+                self._current_method = raw_method or "GET"
+                self._current_fields = []
+                self._labels_by_for = {}
+                self._in_label = False
+                self._label_for = ""
+                self._label_buf = []
+                self._label_wrapped_field_indices = []
+        elif self._form_depth == 1:
+            if t == "label":
+                self._in_label = True
+                self._label_for = str(attr_map.get("for") or "").strip()
+                self._label_buf = []
+                self._label_wrapped_field_indices = []
+            elif t in ("input", "textarea", "select"):
+                if t == "input":
+                    field_type = str(attr_map.get("type") or "text").strip().lower() or "text"
+                    if field_type in _NON_DATA_INPUT_TYPES:
+                        return
+                else:
+                    field_type = t
+                field_id = str(attr_map.get("id") or "").strip()
+                field_name = str(attr_map.get("name") or "").strip() or field_id
+                fallback_label = (
+                    str(attr_map.get("aria-label") or "").strip()
+                    or str(attr_map.get("placeholder") or "").strip()
+                )
+                required = "required" in attr_map
+                field_entry: dict[str, Any] = {
+                    "_id": field_id,
+                    "name": field_name,
+                    "field_type": field_type,
+                    "label": fallback_label,
+                    "required": required,
+                }
+                self._current_fields.append(field_entry)
+                if self._in_label:
+                    self._label_wrapped_field_indices.append(len(self._current_fields) - 1)
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t == "form" and self._form_depth > 0:
+            if self._form_depth == 1:
+                resolved_fields: list[dict[str, Any]] = []
+                for fld in self._current_fields:
+                    fid = fld.pop("_id", "")
+                    if fid and fid in self._labels_by_for and self._labels_by_for[fid]:
+                        fld["label"] = self._labels_by_for[fid]
+                    resolved_fields.append(fld)
+                self.forms.append(
+                    {
+                        "form_index": len(self.forms),
+                        "action": self._current_action,
+                        "method": self._current_method,
+                        "fields": resolved_fields,
+                    }
+                )
+            self._form_depth -= 1
+        elif self._form_depth == 1 and t == "label" and self._in_label:
+            label_text = " ".join("".join(self._label_buf).split())
+            if self._label_for and label_text:
+                self._labels_by_for[self._label_for] = label_text
+            if label_text:
+                for idx in self._label_wrapped_field_indices:
+                    if 0 <= idx < len(self._current_fields):
+                        self._current_fields[idx]["label"] = label_text
+            self._in_label = False
+            self._label_for = ""
+            self._label_buf = []
+            self._label_wrapped_field_indices = []
+
+    def handle_data(self, data: str) -> None:
+        if self._form_depth == 1 and self._in_label:
+            self._label_buf.append(data)
+
+
+def _parse_html_forms(html: str) -> list[dict[str, Any]]:
+    parser = _HTMLFormParser()
+    parser.feed(html)
+    parser.close()
+    return parser.forms
+
+
+def _is_secret_selector(selector: str) -> bool:
+    lowered = selector.lower()
+    return any(hint in lowered for hint in _SECRET_SELECTOR_HINTS)
 
 
 def diff_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
@@ -508,6 +665,179 @@ class LocalBrowserSession:
 
         self._record_action("extract_tables", url or "page", "ok", count=len(results))
         return results
+
+    async def extract_forms(
+        self,
+        max_forms: int = 10,
+        max_fields: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Extract compact form schemas from the active page without exposing secret values."""
+        if max_forms < 0:
+            raise ValueError("max_forms must be >= 0")
+        if max_fields < 0:
+            raise ValueError("max_fields must be >= 0")
+        page = self._require_page()
+        url = self._resolve_current_url(page)
+
+        raw_forms: list[dict[str, Any]] = []
+        try:
+            evaluated: Any = None
+            if hasattr(page, "evaluate") and callable(page.evaluate):
+                evaluated = await page.evaluate(_EXTRACT_FORMS_JS)
+            if isinstance(evaluated, list):
+                raw_forms = [item for item in evaluated if isinstance(item, dict)]
+            elif hasattr(page, "content") and callable(page.content):
+                html = str(await page.content())
+                raw_forms = _parse_html_forms(html)
+        except Exception:
+            self._record_action("extract_forms", url or "page", "error")
+            raise
+
+        results: list[dict[str, Any]] = []
+        for idx, item in enumerate(raw_forms[:max_forms]):
+            form_index = int(item.get("form_index", idx))
+            action = str(item.get("action") or "").strip()
+            method = str(item.get("method") or "GET").strip().upper() or "GET"
+            raw_fields = item.get("fields") or []
+            fields: list[dict[str, Any]] = []
+            for raw_field in raw_fields:
+                if len(fields) >= max_fields:
+                    break
+                if not isinstance(raw_field, dict):
+                    continue
+                # Strictly project only schema metadata; never expose current/default values.
+                fields.append(
+                    {
+                        "name": str(raw_field.get("name") or "").strip(),
+                        "field_type": str(raw_field.get("field_type") or "text").strip().lower()
+                        or "text",
+                        "label": str(raw_field.get("label") or "").strip(),
+                        "required": bool(raw_field.get("required", False)),
+                    }
+                )
+            results.append(
+                {
+                    "form_index": form_index,
+                    "action": action,
+                    "method": method,
+                    "fields": fields,
+                }
+            )
+
+        self._record_action("extract_forms", url or "page", "ok", count=len(results))
+        return results
+
+    async def run_action_sequence(
+        self,
+        steps: list[dict[str, Any]],
+        *,
+        stop_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Execute an ordered sequence of browser actions with SSRF and redaction guards."""
+        if not isinstance(steps, list):
+            raise ValueError("run_action_sequence requires a list of step dicts")
+
+        total_steps = len(steps)
+        completed_steps = 0
+        results: list[dict[str, Any]] = []
+        all_ok = True
+
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                all_ok = False
+                results.append(
+                    {
+                        "step_index": idx,
+                        "action": "",
+                        "ok": False,
+                        "error": "Each step must be a dict",
+                        "error_type": "ValueError",
+                    }
+                )
+                if stop_on_error:
+                    break
+                continue
+
+            action = str(step.get("action") or "").strip()
+            try:
+                if action == "goto":
+                    url = step.get("url")
+                    if not isinstance(url, str) or not url.strip():
+                        raise ValueError("goto step requires a non-empty 'url' string")
+                    timeout_ms = int(step.get("timeout_ms", 15_000))
+                    output: Any = await self.goto(url, timeout_ms=timeout_ms)
+                elif action == "fill":
+                    selector = step.get("selector")
+                    value = step.get("value")
+                    if not isinstance(selector, str) or not selector.strip():
+                        raise ValueError("fill step requires a non-empty 'selector' string")
+                    if not isinstance(value, str):
+                        raise ValueError("fill step requires a string 'value'")
+                    if "redact_value" in step:
+                        redact_value = bool(step["redact_value"])
+                    elif "redact" in step:
+                        redact_value = bool(step["redact"])
+                    else:
+                        redact_value = _is_secret_selector(selector)
+                    output = await self.fill_input(selector, value, redact_value=redact_value)
+                elif action == "click":
+                    selector = step.get("selector")
+                    if not isinstance(selector, str) or not selector.strip():
+                        raise ValueError("click step requires a non-empty 'selector' string")
+                    await self.click(selector)
+                    output = {"selector": selector, "clicked": True}
+                elif action == "snapshot":
+                    max_chars = int(step.get("max_chars", 2000))
+                    output = await self.snapshot_dom_summary(max_chars=max_chars)
+                elif action == "extract_tables":
+                    max_tables = int(step.get("max_tables", 10))
+                    max_rows = int(step.get("max_rows", 25))
+                    tables = await self.extract_tables(max_tables=max_tables, max_rows=max_rows)
+                    output = {"tables": tables, "count": len(tables)}
+                elif action == "extract_forms":
+                    max_forms = int(step.get("max_forms", 10))
+                    max_fields = int(step.get("max_fields", 30))
+                    forms = await self.extract_forms(max_forms=max_forms, max_fields=max_fields)
+                    output = {"forms": forms, "count": len(forms)}
+                else:
+                    raise ValueError(f"Unsupported action in sequence: {action!r}")
+
+                completed_steps += 1
+                results.append(
+                    {
+                        "step_index": idx,
+                        "action": action,
+                        "ok": True,
+                        "output": output,
+                    }
+                )
+            except Exception as exc:
+                all_ok = False
+                results.append(
+                    {
+                        "step_index": idx,
+                        "action": action,
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                if stop_on_error:
+                    break
+
+        self._record_action(
+            "run_action_sequence",
+            self._current_url or "session",
+            "ok" if all_ok else "error",
+            completed_steps=completed_steps,
+            total_steps=total_steps,
+        )
+        return {
+            "ok": all_ok,
+            "completed_steps": completed_steps,
+            "total_steps": total_steps,
+            "results": results,
+        }
 
     async def snapshot_dom_summary(self, max_chars: int = 2000) -> dict[str, Any]:
         """Return a compact, token-budgeted DOM summary for edge LLM consumption."""

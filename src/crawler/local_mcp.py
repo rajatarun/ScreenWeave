@@ -155,6 +155,35 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["before", "after"],
         },
     },
+    {
+        "name": "browser_extract_forms",
+        "description": "Discover compact form schemas (action, method, fields) from the active page without exposing secret values.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_forms": {"type": "integer", "default": 10},
+                "max_fields": {"type": "integer", "default": 30},
+                "session_id": {"type": "string", "default": "default"},
+            },
+        },
+    },
+    {
+        "name": "browser_run_sequence",
+        "description": "Execute an ordered sequence of browser actions (goto, fill, click, snapshot, extract_tables, extract_forms) with SSRF and redaction guards.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Ordered list of step dicts with an 'action' key.",
+                },
+                "stop_on_error": {"type": "boolean", "default": True},
+                "session_id": {"type": "string", "default": "default"},
+            },
+            "required": ["steps"],
+        },
+    },
 ]
 
 
@@ -314,6 +343,27 @@ class LocalBrowserMCPServer:
                 raise ValueError("browser_diff_snapshots requires dict 'before' and 'after' arguments")
             return diff_snapshots(before, after)
 
+        if name == "browser_extract_forms":
+            max_forms = int(args.get("max_forms", 10))
+            max_fields = int(args.get("max_fields", 30))
+            session = self._require_session(session_id)
+            forms = await session.extract_forms(max_forms=max_forms, max_fields=max_fields)
+            return {"session_id": session_id, "forms": forms, "count": len(forms)}
+
+        if name == "browser_run_sequence":
+            steps = args.get("steps")
+            if not isinstance(steps, list):
+                raise ValueError("browser_run_sequence requires a list 'steps' argument")
+            stop_on_error = bool(args.get("stop_on_error", True))
+            if session_id in self._sessions:
+                session = self._require_session(session_id)
+            elif steps and isinstance(steps[0], dict) and steps[0].get("action") == "goto":
+                session = await self._get_or_create_session(session_id)
+            else:
+                session = self._require_session(session_id)
+            seq_result = await session.run_action_sequence(steps, stop_on_error=stop_on_error)
+            return {"session_id": session_id, **seq_result}
+
         raise LookupError(f"Unknown browser tool: {name!r}")
 
     async def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -372,6 +422,8 @@ class LocalBrowserMCPServer:
                 "browser_action_log",
                 "browser_extract_tables",
                 "browser_diff_snapshots",
+                "browser_extract_forms",
+                "browser_run_sequence",
             ):
                 payload = await self._dispatch_tool(direct_name, params)
                 return _jsonrpc_result(req_id, payload)
